@@ -1,0 +1,12 @@
+{
+  "name": "clawdbot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Self-hosted personal AI assistant built on OpenClaw",
+  "scripts": {
+    "install:server": "bash scripts/install.sh",
+    "healthcheck": "bash scripts/healthcheck.sh",
+    "backup": "bash scripts/backup.sh",
+    "update:server": "bash scripts/update.sh"
+  }
+}

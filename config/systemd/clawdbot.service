@@ -1,0 +1,17 @@
+[Unit]
+Description=Clawdbot OpenClaw Service
+After=network.target
+
+[Service]
+Type=simple
+User=clawdbot
+WorkingDirectory=/home/clawdbot/clawdbot
+EnvironmentFile=/home/clawdbot/clawdbot/.env
+ExecStart=/usr/bin/env bash -lc 'pnpm run openclaw -- start --config ./config/openclaw.jsonc'
+Restart=always
+RestartSec=5
+StandardOutput=append:/home/clawdbot/clawdbot/logs/clawdbot.log
+StandardError=append:/home/clawdbot/clawdbot/logs/clawdbot-error.log
+
+[Install]
+WantedBy=multi-user.target
