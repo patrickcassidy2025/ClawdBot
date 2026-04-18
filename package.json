@@ -1,12 +1,13 @@
 {
   "name": "clawdbot",
-  "version": "0.1.0",
-  "private": true,
-  "description": "Self-hosted personal AI assistant built on OpenClaw",
+  "version": "1.0.0",
+  "type": "module",
   "scripts": {
-    "install:server": "bash scripts/install.sh",
-    "healthcheck": "bash scripts/healthcheck.sh",
-    "backup": "bash scripts/backup.sh",
-    "update:server": "bash scripts/update.sh"
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "node-telegram-bot-api": "^0.66.0",
+    "dotenv": "^16.0.0"
   }
 }
