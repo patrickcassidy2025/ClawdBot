@@ -146,6 +146,22 @@ bot.onText(/^\/status(?:@\w+)?$/, async (msg) => {
 
 const GITHUB_PR_URL_RE = /^https?:\/\/github\.com\/([^\/\s]+)\/([^\/\s]+)\/pull\/(\d+)/;
 
+function chunkMessage(text, limit = 4000) {
+  if (text.length <= limit) return [text];
+  const chunks = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    let cut = remaining.lastIndexOf('\n\n', limit);
+    if (cut < limit * 0.5) cut = remaining.lastIndexOf('\n', limit);
+    if (cut < limit * 0.5) cut = remaining.lastIndexOf(' ', limit);
+    if (cut <= 0) cut = limit;
+    chunks.push(remaining.slice(0, cut).trimEnd());
+    remaining = remaining.slice(cut).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
+
 async function githubFetch(urlPath, { accept = 'application/vnd.github+json' } = {}) {
   const headers = {
     'Accept': accept,
@@ -214,7 +230,9 @@ bot.onText(/^\/review(?:@\w+)?\s+(\S+)/, async (msg, match) => {
     insertMessage.run(chatId, 'assistant', reply, Date.now());
 
     const header = `Review of ${owner}/${repo}#${number}: ${pr.title}\n\n`;
-    await bot.sendMessage(chatId, header + reply);
+    for (const chunk of chunkMessage(header + reply)) {
+      await bot.sendMessage(chatId, chunk);
+    }
   } catch (err) {
     console.error('PR review error:', err);
     await bot.sendMessage(chatId, `Couldn't review that PR: ${err.message}`);
