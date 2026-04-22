@@ -35,6 +35,9 @@ backup/
 *.sock
 *.swp
 
+# Local persistent data
+data/
+
 # Workspace volatile state
 workspace/memory.md
 workspace/notes/*
