@@ -3,6 +3,9 @@ import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import TelegramBot from 'node-telegram-bot-api';
 import Database from 'better-sqlite3';
+import cron from 'node-cron';
+import http from 'http';
+import crypto from 'crypto';
 import { readFileSync, mkdirSync, createReadStream, promises as fsp } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
@@ -115,6 +118,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/help — show this help message',
     '/clear — reset your conversation history',
     '/status — show uptime and memory usage',
+    '/review <github-pr-url> — review a GitHub pull request',
     '',
     'You can also send me:',
     '• PDF documents — I\'ll summarise them',
@@ -138,6 +142,83 @@ bot.onText(/^\/status(?:@\w+)?$/, async (msg) => {
     `Heap: ${mb(mem.heapUsed)} / ${mb(mem.heapTotal)} MB`,
   ].join('\n');
   await bot.sendMessage(msg.chat.id, status);
+});
+
+const GITHUB_PR_URL_RE = /^https?:\/\/github\.com\/([^\/\s]+)\/([^\/\s]+)\/pull\/(\d+)/;
+
+async function githubFetch(urlPath, { accept = 'application/vnd.github+json' } = {}) {
+  const headers = {
+    'Accept': accept,
+    'User-Agent': 'ClawdBot',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (process.env.GITHUB_TOKEN) headers['Authorization'] = `Bearer ${process.env.GITHUB_TOKEN}`;
+  const res = await fetch(`https://api.github.com${urlPath}`, { headers });
+  if (!res.ok) throw new Error(`GitHub ${urlPath} -> ${res.status} ${res.statusText}`);
+  return res;
+}
+
+bot.onText(/^\/review(?:@\w+)?\s+(\S+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+
+  const url = match[1];
+  const parsed = url.match(GITHUB_PR_URL_RE);
+  if (!parsed) {
+    await bot.sendMessage(chatId, 'Please provide a valid GitHub PR URL, e.g. https://github.com/owner/repo/pull/123');
+    return;
+  }
+  const [, owner, repo, number] = parsed;
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+
+    const prRes = await githubFetch(`/repos/${owner}/${repo}/pulls/${number}`);
+    const pr = await prRes.json();
+    const diffRes = await githubFetch(`/repos/${owner}/${repo}/pulls/${number}`, {
+      accept: 'application/vnd.github.v3.diff',
+    });
+    let diff = await diffRes.text();
+    const MAX_DIFF = 120_000;
+    const truncated = diff.length > MAX_DIFF;
+    if (truncated) diff = diff.slice(0, MAX_DIFF) + '\n\n[diff truncated]';
+
+    const prompt = [
+      `Review this pull request.`,
+      ``,
+      `Title: ${pr.title}`,
+      `Author: ${pr.user?.login}`,
+      `Description: ${pr.body || '(none)'}`,
+      ``,
+      `Provide a structured review with these sections:`,
+      `1. Summary of changes`,
+      `2. Potential issues`,
+      `3. Security concerns`,
+      `4. Suggestions`,
+      ``,
+      `Diff:`,
+      '```diff',
+      diff,
+      '```',
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 2048,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const reply = response.content[0].text;
+
+    insertMessage.run(chatId, 'user', `[PR review requested: ${url}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    const header = `Review of ${owner}/${repo}#${number}: ${pr.title}\n\n`;
+    await bot.sendMessage(chatId, header + reply);
+  } catch (err) {
+    console.error('PR review error:', err);
+    await bot.sendMessage(chatId, `Couldn't review that PR: ${err.message}`);
+  }
 });
 
 bot.on('document', async (msg) => {
@@ -285,5 +366,131 @@ bot.on('message', async (msg) => {
     await bot.sendMessage(chatId, 'Something went wrong. Please try again.');
   }
 });
+
+function verifyGithubSignature(rawBody, header) {
+  if (!header || !process.env.GITHUB_WEBHOOK_SECRET) return false;
+  const hmac = crypto.createHmac('sha256', process.env.GITHUB_WEBHOOK_SECRET);
+  hmac.update(rawBody);
+  const expected = Buffer.from(`sha256=${hmac.digest('hex')}`);
+  const received = Buffer.from(header);
+  return expected.length === received.length && crypto.timingSafeEqual(expected, received);
+}
+
+function formatPullRequestEvent(payload) {
+  const pr = payload.pull_request;
+  const repo = payload.repository?.full_name;
+  const actor = pr?.user?.login;
+  if (payload.action === 'opened') {
+    return `🟢 PR opened in ${repo} by ${actor}\n#${pr.number} ${pr.title}\n${pr.html_url}`;
+  }
+  if (payload.action === 'closed') {
+    if (pr.merged) return `🟣 PR merged in ${repo}\n#${pr.number} ${pr.title}\n${pr.html_url}`;
+    return `🔴 PR closed (unmerged) in ${repo}\n#${pr.number} ${pr.title}\n${pr.html_url}`;
+  }
+  return null;
+}
+
+function formatWorkflowRunEvent(payload) {
+  const run = payload.workflow_run;
+  if (payload.action !== 'completed' || run?.conclusion !== 'failure') return null;
+  const repo = payload.repository?.full_name;
+  return `❌ Workflow failed in ${repo}\n${run.name} on ${run.head_branch} (${run.head_sha?.slice(0, 7)})\n${run.html_url}`;
+}
+
+async function handleWebhookEvent(event, payload) {
+  const notifyId = process.env.TELEGRAM_NOTIFY_CHAT_ID;
+  if (!notifyId) return;
+  let text = null;
+  if (event === 'pull_request') text = formatPullRequestEvent(payload);
+  else if (event === 'workflow_run') text = formatWorkflowRunEvent(payload);
+  if (text) await bot.sendMessage(notifyId, text);
+}
+
+if (process.env.GITHUB_WEBHOOK_SECRET && process.env.TELEGRAM_NOTIFY_CHAT_ID) {
+  const server = http.createServer(async (req, res) => {
+    if (req.method !== 'POST' || req.url !== '/webhook') {
+      res.writeHead(404); res.end('not found'); return;
+    }
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const raw = Buffer.concat(chunks);
+
+    if (!verifyGithubSignature(raw, req.headers['x-hub-signature-256'])) {
+      res.writeHead(401); res.end('invalid signature'); return;
+    }
+
+    let payload;
+    try { payload = JSON.parse(raw.toString('utf8')); }
+    catch { res.writeHead(400); res.end('invalid json'); return; }
+
+    res.writeHead(200); res.end('ok');
+
+    try { await handleWebhookEvent(req.headers['x-github-event'], payload); }
+    catch (err) { console.error('Webhook handler error:', err); }
+  });
+  server.listen(3001, () => console.log('GitHub webhook server listening on :3001'));
+} else {
+  console.log('GitHub webhook server disabled (set GITHUB_WEBHOOK_SECRET and TELEGRAM_NOTIFY_CHAT_ID to enable).');
+}
+
+async function fetchOpenPRs() {
+  if (!process.env.GITHUB_REPO) return [];
+  const res = await githubFetch(`/repos/${process.env.GITHUB_REPO}/pulls?state=open&per_page=20`);
+  const prs = await res.json();
+  return prs.map(p => ({ number: p.number, title: p.title, user: p.user?.login, url: p.html_url, draft: p.draft }));
+}
+
+async function fetchWeather() {
+  const location = process.env.WEATHER_LOCATION || '';
+  const res = await fetch(`https://wttr.in/${encodeURIComponent(location)}?format=4`, {
+    headers: { 'User-Agent': 'curl/8.0' },
+  });
+  if (!res.ok) throw new Error(`wttr.in -> ${res.status}`);
+  return (await res.text()).trim();
+}
+
+async function sendDailyBriefing() {
+  const notifyId = process.env.TELEGRAM_NOTIFY_CHAT_ID;
+  if (!notifyId) return;
+
+  try {
+    const [prs, weather] = await Promise.all([
+      fetchOpenPRs().catch(err => { console.error('PR fetch failed:', err); return []; }),
+      fetchWeather().catch(err => { console.error('Weather fetch failed:', err); return 'unavailable'; }),
+    ]);
+
+    const prList = prs.length
+      ? prs.map(p => `- #${p.number}${p.draft ? ' (draft)' : ''} ${p.title} — @${p.user}`).join('\n')
+      : '(no open PRs)';
+
+    const prompt = [
+      `Write a friendly morning briefing for Patrick. Keep it warm but concise (4-8 short lines).`,
+      `Start with a greeting and include the weather. Then summarise the open PRs. End with a small motivational nudge.`,
+      ``,
+      `Weather: ${weather}`,
+      ``,
+      `Open PRs in ${process.env.GITHUB_REPO || '(no repo configured)'}:`,
+      prList,
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 600,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+
+    await bot.sendMessage(notifyId, response.content[0].text);
+  } catch (err) {
+    console.error('Daily briefing failed:', err);
+  }
+}
+
+if (process.env.TELEGRAM_NOTIFY_CHAT_ID) {
+  cron.schedule('0 8 * * *', sendDailyBriefing, { timezone: 'Etc/UTC' });
+  console.log('Daily briefing scheduled for 08:00 UTC');
+} else {
+  console.log('Daily briefing disabled (set TELEGRAM_NOTIFY_CHAT_ID to enable).');
+}
 
 console.log('ClawdBot is running...');
