@@ -624,11 +624,37 @@ if (process.env.GITHUB_WEBHOOK_SECRET && process.env.TELEGRAM_NOTIFY_CHAT_ID) {
   console.log('GitHub webhook server disabled (set GITHUB_WEBHOOK_SECRET and TELEGRAM_NOTIFY_CHAT_ID to enable).');
 }
 
+function getConfiguredRepos() {
+  const list = (process.env.GITHUB_REPOS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+  if (list.length) return list;
+  return process.env.GITHUB_REPO ? [process.env.GITHUB_REPO] : [];
+}
+
 async function fetchOpenPRs() {
-  if (!process.env.GITHUB_REPO) return [];
-  const res = await githubFetch(`/repos/${process.env.GITHUB_REPO}/pulls?state=open&per_page=20`);
-  const prs = await res.json();
-  return prs.map(p => ({ number: p.number, title: p.title, user: p.user?.login, url: p.html_url, draft: p.draft }));
+  const repos = getConfiguredRepos();
+  if (!repos.length) return [];
+  return Promise.all(repos.map(async (repo) => {
+    try {
+      const res = await githubFetch(`/repos/${repo}/pulls?state=open&per_page=20`);
+      const prs = await res.json();
+      return {
+        repo,
+        prs: prs.map(p => ({
+          number: p.number,
+          title: p.title,
+          user: p.user?.login,
+          url: p.html_url,
+          draft: p.draft,
+        })),
+      };
+    } catch (err) {
+      console.error(`PR fetch failed for ${repo}:`, err);
+      return { repo, prs: [], error: err.message };
+    }
+  }));
 }
 
 async function fetchWeather() {
@@ -645,23 +671,31 @@ async function sendDailyBriefing() {
   if (!notifyId) return;
 
   try {
-    const [prs, weather] = await Promise.all([
+    const [prsByRepo, weather] = await Promise.all([
       fetchOpenPRs().catch(err => { console.error('PR fetch failed:', err); return []; }),
       fetchWeather().catch(err => { console.error('Weather fetch failed:', err); return 'unavailable'; }),
     ]);
 
-    const prList = prs.length
-      ? prs.map(p => `- #${p.number}${p.draft ? ' (draft)' : ''} ${p.title} — @${p.user}`).join('\n')
-      : '(no open PRs)';
+    const totalPRs = prsByRepo.reduce((n, r) => n + r.prs.length, 0);
+    const prSummary = prsByRepo.length
+      ? prsByRepo.map(({ repo, prs, error }) => {
+          if (error) return `${repo}: (error fetching PRs: ${error})`;
+          if (!prs.length) return `${repo}: (no open PRs)`;
+          const lines = prs
+            .map(p => `  - #${p.number}${p.draft ? ' (draft)' : ''} ${p.title} — @${p.user}`)
+            .join('\n');
+          return `${repo}:\n${lines}`;
+        }).join('\n\n')
+      : '(no repos configured)';
 
     const prompt = [
-      `Write a friendly morning briefing for Patrick. Keep it warm but concise (4-8 short lines).`,
-      `Start with a greeting and include the weather. Then summarise the open PRs. End with a small motivational nudge.`,
+      `Write a friendly morning briefing for Patrick. Keep it warm but concise (5-10 short lines).`,
+      `Start with a greeting and include the weather. Then summarise the open PRs across all repos — group by repo and call out anything notable. End with a small motivational nudge.`,
       ``,
       `Weather: ${weather}`,
       ``,
-      `Open PRs in ${process.env.GITHUB_REPO || '(no repo configured)'}:`,
-      prList,
+      `Open PRs across ${prsByRepo.length} repo(s), ${totalPRs} total:`,
+      prSummary,
     ].join('\n');
 
     const response = await anthropic.messages.create({
