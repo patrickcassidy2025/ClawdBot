@@ -44,3 +44,4 @@ It runs on an Ubuntu VPS, connects to Telegram, and uses Claude as the initial m
 - `docs/setup/model-auth.md`
 - `docs/operations/runbook.md`
 - `docs/operations/troubleshooting.md`
+test
