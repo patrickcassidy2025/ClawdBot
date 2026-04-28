@@ -7,6 +7,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.39.0",
+    "@tavily/core": "^0.5.0",
     "better-sqlite3": "^11.5.0",
     "node-cron": "^3.0.3",
     "node-telegram-bot-api": "^0.66.0",

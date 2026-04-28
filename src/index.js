@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import cron from 'node-cron';
 import http from 'http';
 import crypto from 'crypto';
+import { tavily } from '@tavily/core';
 import { readFileSync, mkdirSync, createReadStream, promises as fsp } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
@@ -13,6 +14,11 @@ import path from 'path';
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+const tavilyClient = process.env.TAVILY_API_KEY
+  ? tavily({ apiKey: process.env.TAVILY_API_KEY })
+  : null;
+
+const DASHBOARD_URL = process.env.DASHBOARD_URL || 'http://localhost:3000';
 
 const startTime = Date.now();
 
@@ -119,6 +125,9 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/clear — reset your conversation history',
     '/status — show uptime and memory usage',
     '/review <github-pr-url> — review a GitHub pull request',
+    '/search <query> — web search with sourced summary',
+    '/metrics <question> — ask the delivery-intelligence dashboard',
+    '/metrics status — check if the dashboard is running',
     '',
     'You can also send me:',
     '• PDF documents — I\'ll summarise them',
@@ -236,6 +245,170 @@ bot.onText(/^\/review(?:@\w+)?\s+(\S+)/, async (msg, match) => {
   } catch (err) {
     console.error('PR review error:', err);
     await bot.sendMessage(chatId, `Couldn't review that PR: ${err.message}`);
+  }
+});
+
+bot.onText(/^\/search(?:@\w+)?\s+([\s\S]+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+
+  if (!tavilyClient) {
+    await bot.sendMessage(chatId, 'Web search is unavailable: TAVILY_API_KEY is not set.');
+    return;
+  }
+
+  const query = match[1].trim();
+  if (!query) {
+    await bot.sendMessage(chatId, 'Usage: /search <query>');
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+    const search = await tavilyClient.search(query, {
+      maxResults: 5,
+      includeAnswer: true,
+    });
+    const results = search.results || [];
+    if (!results.length) {
+      await bot.sendMessage(chatId, `No web results found for: ${query}`);
+      return;
+    }
+
+    const sources = results
+      .map((r, i) => `[${i + 1}] ${r.title}\n${r.url}\n${(r.content || '').slice(0, 800)}`)
+      .join('\n\n');
+
+    const prompt = [
+      `Use the web search results below to answer the question concisely and accurately.`,
+      ``,
+      `Question: ${query}`,
+      ``,
+      `Search results:`,
+      sources,
+      ``,
+      `Write a clear answer in 2-5 short paragraphs. Cite sources inline using [1], [2], etc.`,
+      `After the answer, list the sources by number with title and URL.`,
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 1500,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const reply = response.content.map(b => b.text ?? '').join('').trim();
+
+    insertMessage.run(chatId, 'user', `[Web search: ${query}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk);
+    }
+  } catch (err) {
+    console.error('Search handler error:', err);
+    await bot.sendMessage(chatId, `Search failed: ${err.message}`);
+  }
+});
+
+async function consumeSSE(response) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let collected = '';
+
+  const handleEvent = (event) => {
+    for (const line of event.split('\n')) {
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (!data || data === '[DONE]') continue;
+      try {
+        const json = JSON.parse(data);
+        const text =
+          json.choices?.[0]?.delta?.content ??
+          json.delta?.text ??
+          json.content ??
+          json.text ??
+          json.message ??
+          '';
+        if (typeof text === 'string') collected += text;
+      } catch {
+        collected += data;
+      }
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buffer.indexOf('\n\n')) !== -1) {
+      handleEvent(buffer.slice(0, idx));
+      buffer = buffer.slice(idx + 2);
+    }
+  }
+  if (buffer.trim()) handleEvent(buffer);
+  return collected;
+}
+
+bot.onText(/^\/metrics(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+
+  const arg = match[1]?.trim();
+  if (!arg) {
+    await bot.sendMessage(chatId, 'Usage: /metrics <question>  or  /metrics status');
+    return;
+  }
+
+  if (arg.toLowerCase() === 'status') {
+    try {
+      const res = await fetch(`${DASHBOARD_URL}/api/health`);
+      const body = (await res.text()).trim();
+      if (!res.ok) {
+        await bot.sendMessage(chatId, `Dashboard health check failed: ${res.status} ${res.statusText}\n${body}`);
+        return;
+      }
+      await bot.sendMessage(chatId, `Dashboard is up (${res.status}).\n${body || 'ok'}`);
+    } catch (err) {
+      console.error('Metrics status error:', err);
+      await bot.sendMessage(chatId, `Dashboard unreachable: ${err.message}`);
+    }
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+    const res = await fetch(`${DASHBOARD_URL}/api/chat`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'text/event-stream',
+      },
+      body: JSON.stringify({ question: arg }),
+    });
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => '');
+      await bot.sendMessage(chatId, `Dashboard error: ${res.status} ${res.statusText}\n${errBody.slice(0, 500)}`);
+      return;
+    }
+
+    const answer = (await consumeSSE(res)).trim();
+    if (!answer) {
+      await bot.sendMessage(chatId, 'Dashboard returned an empty response.');
+      return;
+    }
+
+    insertMessage.run(chatId, 'user', `[Metrics question: ${arg}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', answer, Date.now());
+
+    for (const chunk of chunkMessage(answer)) {
+      await bot.sendMessage(chatId, chunk);
+    }
+  } catch (err) {
+    console.error('Metrics handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't reach the dashboard: ${err.message}`);
   }
 });
 
