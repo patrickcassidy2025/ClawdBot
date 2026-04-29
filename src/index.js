@@ -130,6 +130,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/metrics status — check if the dashboard is running',
     '/project — daily summary of the Presight-AI GitHub project board',
     '/standup — generate a yesterday/today/blockers standup update',
+    '/ask <question> — natural-language Q&A over recent GitHub activity',
     '',
     'You can also send me:',
     '• PDF documents — I\'ll summarise them',
@@ -657,6 +658,98 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
   }
 });
 
+bot.onText(/^\/ask(?:@\w+)?\s+([\s\S]+)/, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+
+  const question = match[1].trim();
+  if (!question) {
+    await bot.sendMessage(chatId, 'Usage: /ask <question>');
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+
+    const sinceMs = Date.now() - 7 * 24 * 60 * 60 * 1000;
+    const sinceIso = new Date(sinceMs).toISOString();
+
+    const [commitsByRepo, mergedByRepo, openByRepo] = await Promise.all([
+      fetchRecentCommits(sinceIso).catch(err => { console.error('Commits fetch failed:', err); return []; }),
+      fetchRecentlyMergedPRs(sinceMs).catch(err => { console.error('Merged PR fetch failed:', err); return []; }),
+      fetchOpenPRs().catch(err => { console.error('Open PR fetch failed:', err); return []; }),
+    ]);
+
+    const commitsSection = commitsByRepo.length
+      ? commitsByRepo.map(({ repo, commits, error }) => {
+          if (error) return `${repo}: (error: ${error})`;
+          if (!commits.length) return `${repo}: (no commits)`;
+          const lines = commits
+            .map(c => `  - ${c.sha} ${c.message} — @${c.author} (${c.date})`)
+            .join('\n');
+          return `${repo}:\n${lines}`;
+        }).join('\n\n')
+      : '(no repos configured)';
+
+    const mergedSection = mergedByRepo.length
+      ? mergedByRepo.map(({ repo, prs, error }) => {
+          if (error) return `${repo}: (error: ${error})`;
+          if (!prs.length) return `${repo}: (no merged PRs)`;
+          const lines = prs
+            .map(p => `  - #${p.number} ${p.title} — @${p.user} (merged ${p.merged_at})`)
+            .join('\n');
+          return `${repo}:\n${lines}`;
+        }).join('\n\n')
+      : '(no repos configured)';
+
+    const openSection = openByRepo.length
+      ? openByRepo.map(({ repo, prs, error }) => {
+          if (error) return `${repo}: (error: ${error})`;
+          if (!prs.length) return `${repo}: (no open PRs)`;
+          const lines = prs
+            .map(p => `  - #${p.number}${p.draft ? ' (draft)' : ''} ${p.title} — @${p.user}`)
+            .join('\n');
+          return `${repo}:\n${lines}`;
+        }).join('\n\n')
+      : '(no repos configured)';
+
+    const prompt = [
+      `Answer Patrick's question about the Presight-AI GitHub org using only the activity data below.`,
+      `Be concise, factual, and natural — write like a colleague summarising the week. Short paragraphs or grouped bullets, no markdown headings.`,
+      `If the data doesn't contain enough information to answer, say so honestly rather than guessing.`,
+      ``,
+      `Question: ${question}`,
+      ``,
+      `=== Commits in the last 7 days ===`,
+      commitsSection,
+      ``,
+      `=== PRs merged in the last 7 days ===`,
+      mergedSection,
+      ``,
+      `=== Currently open PRs ===`,
+      openSection,
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 1500,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const reply = response.content.map(b => b.text ?? '').join('').trim();
+
+    insertMessage.run(chatId, 'user', `[Ask: ${question}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk);
+    }
+  } catch (err) {
+    console.error('Ask handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't answer that: ${err.message}`);
+  }
+});
+
 bot.on('document', async (msg) => {
   const chatId = msg.chat.id;
   const doc = msg.document;
@@ -898,6 +991,58 @@ async function fetchOpenPRs() {
       };
     } catch (err) {
       console.error(`PR fetch failed for ${repo}:`, err);
+      return { repo, prs: [], error: err.message };
+    }
+  }));
+}
+
+async function fetchRecentCommits(sinceIso) {
+  const repos = getConfiguredRepos();
+  if (!repos.length) return [];
+  return Promise.all(repos.map(async (repo) => {
+    try {
+      const res = await githubFetch(
+        `/repos/${repo}/commits?since=${encodeURIComponent(sinceIso)}&per_page=50`
+      );
+      const commits = await res.json();
+      return {
+        repo,
+        commits: commits.map(c => ({
+          sha: c.sha?.slice(0, 7),
+          message: (c.commit?.message || '').split('\n')[0],
+          author: c.author?.login || c.commit?.author?.name || 'unknown',
+          date: c.commit?.author?.date,
+          url: c.html_url,
+        })),
+      };
+    } catch (err) {
+      console.error(`Commits fetch failed for ${repo}:`, err);
+      return { repo, commits: [], error: err.message };
+    }
+  }));
+}
+
+async function fetchRecentlyMergedPRs(sinceMs) {
+  const repos = getConfiguredRepos();
+  if (!repos.length) return [];
+  return Promise.all(repos.map(async (repo) => {
+    try {
+      const res = await githubFetch(
+        `/repos/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=20`
+      );
+      const prs = await res.json();
+      const merged = prs
+        .filter(p => p.merged_at && new Date(p.merged_at).getTime() >= sinceMs)
+        .map(p => ({
+          number: p.number,
+          title: p.title,
+          user: p.user?.login,
+          url: p.html_url,
+          merged_at: p.merged_at,
+        }));
+      return { repo, prs: merged };
+    } catch (err) {
+      console.error(`Merged PR fetch failed for ${repo}:`, err);
       return { repo, prs: [], error: err.message };
     }
   }));
