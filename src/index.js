@@ -129,6 +129,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/metrics <question> — ask the delivery-intelligence dashboard',
     '/metrics status — check if the dashboard is running',
     '/project — daily summary of the Presight-AI GitHub project board',
+    '/standup — generate a yesterday/today/blockers standup update',
     '',
     'You can also send me:',
     '• PDF documents — I\'ll summarise them',
@@ -580,6 +581,82 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
   }
 });
 
+bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+
+  const org = process.env.GITHUB_PROJECT_ORG;
+  const number = Number(process.env.GITHUB_PROJECT_NUMBER);
+  const projectFetch = (org && Number.isInteger(number))
+    ? fetchProjectItems(org, number).catch(err => { console.error('Project fetch failed:', err); return null; })
+    : Promise.resolve(null);
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+
+    const [prsByRepo, project] = await Promise.all([
+      fetchOpenPRs().catch(err => { console.error('PR fetch failed:', err); return []; }),
+      projectFetch,
+    ]);
+
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    const allOpenPRs = prsByRepo.flatMap(({ repo, prs }) => prs.map(p => ({ repo, ...p })));
+    const recentPRs = allOpenPRs.filter(
+      p => p.updated_at && new Date(p.updated_at).getTime() >= cutoff
+    );
+
+    const inProgress = project ? project.items.filter(it => it.status === 'In Progress') : [];
+    const blocked = project ? project.items.filter(it => it.status === 'Blocked') : [];
+
+    const formatPR = (p) =>
+      `  - ${p.repo}#${p.number}${p.draft ? ' (draft)' : ''} ${p.title}`;
+    const formatItem = (it) => {
+      const ref = it.number ? `#${it.number} ` : '';
+      const who = it.assignees.length ? ` (@${it.assignees.join(', @')})` : '';
+      return `  - ${ref}${it.title}${who}`;
+    };
+
+    const prompt = [
+      `Write a daily standup update for Patrick that can be pasted directly into Slack or Teams.`,
+      `Use exactly these three sections, in this order, with the bold labels shown:`,
+      `**Yesterday** — derive from PRs updated in the last 24 hours.`,
+      `**Today** — derive from in-progress project board items and open PRs.`,
+      `**Blockers** — list blocked project board items, or write "None" if there are none.`,
+      `Tight bullets only. No preamble, no sign-off, no emoji, professional tone.`,
+      ``,
+      `=== PRs updated in the last 24 hours ===`,
+      recentPRs.length ? recentPRs.map(formatPR).join('\n') : '(none)',
+      ``,
+      `=== All open PRs (context) ===`,
+      allOpenPRs.length ? allOpenPRs.map(formatPR).join('\n') : '(none)',
+      ``,
+      `=== Project board: In Progress ===`,
+      inProgress.length ? inProgress.map(formatItem).join('\n') : '(none)',
+      ``,
+      `=== Project board: Blocked ===`,
+      blocked.length ? blocked.map(formatItem).join('\n') : '(none)',
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 800,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const reply = response.content.map(b => b.text ?? '').join('').trim();
+
+    insertMessage.run(chatId, 'user', '[Standup requested]', Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk);
+    }
+  } catch (err) {
+    console.error('Standup handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't generate standup: ${err.message}`);
+  }
+});
+
 bot.on('document', async (msg) => {
   const chatId = msg.chat.id;
   const doc = msg.document;
@@ -816,6 +893,7 @@ async function fetchOpenPRs() {
           user: p.user?.login,
           url: p.html_url,
           draft: p.draft,
+          updated_at: p.updated_at,
         })),
       };
     } catch (err) {
