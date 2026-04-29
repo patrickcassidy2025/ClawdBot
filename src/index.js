@@ -128,6 +128,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/search <query> — web search with sourced summary',
     '/metrics <question> — ask the delivery-intelligence dashboard',
     '/metrics status — check if the dashboard is running',
+    '/project — daily summary of the Presight-AI GitHub project board',
     '',
     'You can also send me:',
     '• PDF documents — I\'ll summarise them',
@@ -409,6 +410,173 @@ bot.onText(/^\/metrics(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
   } catch (err) {
     console.error('Metrics handler error:', err);
     await bot.sendMessage(chatId, `Couldn't reach the dashboard: ${err.message}`);
+  }
+});
+
+const PROJECT_ITEMS_QUERY = `
+  query($org: String!, $number: Int!, $after: String) {
+    organization(login: $org) {
+      projectV2(number: $number) {
+        title
+        url
+        items(first: 100, after: $after) {
+          pageInfo { hasNextPage endCursor }
+          nodes {
+            type
+            content {
+              __typename
+              ... on Issue {
+                title number url state
+                assignees(first: 10) { nodes { login } }
+              }
+              ... on PullRequest {
+                title number url state
+                assignees(first: 10) { nodes { login } }
+              }
+              ... on DraftIssue {
+                title
+                assignees(first: 10) { nodes { login } }
+              }
+            }
+            fieldValues(first: 20) {
+              nodes {
+                __typename
+                ... on ProjectV2ItemFieldSingleSelectValue {
+                  name
+                  field { ... on ProjectV2FieldCommon { name } }
+                }
+                ... on ProjectV2ItemFieldTextValue {
+                  text
+                  field { ... on ProjectV2FieldCommon { name } }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+async function githubGraphQL(query, variables) {
+  if (!process.env.GITHUB_TOKEN) throw new Error('GITHUB_TOKEN is not set');
+  const res = await fetch('https://api.github.com/graphql', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.GITHUB_TOKEN}`,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'User-Agent': 'ClawdBot',
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const json = await res.json();
+  if (!res.ok || json.errors) {
+    const detail = json.errors ? JSON.stringify(json.errors) : `${res.status} ${res.statusText}`;
+    throw new Error(`GraphQL error: ${detail}`);
+  }
+  return json.data;
+}
+
+async function fetchProjectItems(org, number) {
+  const items = [];
+  let after = null;
+  let projectMeta = null;
+  while (true) {
+    const data = await githubGraphQL(PROJECT_ITEMS_QUERY, { org, number, after });
+    const project = data.organization?.projectV2;
+    if (!project) throw new Error(`Project ${org}/#${number} not found or not accessible`);
+    if (!projectMeta) projectMeta = { title: project.title, url: project.url };
+    for (const node of project.items.nodes) {
+      const content = node.content;
+      if (!content) continue;
+      const statusNode = node.fieldValues.nodes.find(
+        v => v.__typename === 'ProjectV2ItemFieldSingleSelectValue' && v.field?.name === 'Status'
+      );
+      items.push({
+        title: content.title,
+        type: content.__typename,
+        number: content.number ?? null,
+        url: content.url ?? null,
+        state: content.state ?? null,
+        assignees: content.assignees?.nodes?.map(a => a.login) || [],
+        status: statusNode?.name || 'No status',
+      });
+    }
+    if (!project.items.pageInfo.hasNextPage) break;
+    after = project.items.pageInfo.endCursor;
+  }
+  return { items, ...projectMeta };
+}
+
+bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+
+  const org = process.env.GITHUB_PROJECT_ORG;
+  const number = Number(process.env.GITHUB_PROJECT_NUMBER);
+  if (!org || !Number.isInteger(number)) {
+    await bot.sendMessage(chatId, 'Project board not configured: set GITHUB_PROJECT_ORG and GITHUB_PROJECT_NUMBER.');
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+    const { items, title, url } = await fetchProjectItems(org, number);
+
+    if (!items.length) {
+      await bot.sendMessage(chatId, `Project "${title}" has no items.`);
+      return;
+    }
+
+    const byStatus = items.reduce((acc, it) => {
+      (acc[it.status] = acc[it.status] || []).push(it);
+      return acc;
+    }, {});
+
+    const counts = Object.entries(byStatus)
+      .map(([status, list]) => `${status}: ${list.length}`)
+      .join(', ');
+
+    const detail = Object.entries(byStatus)
+      .map(([status, list]) => {
+        const lines = list.map(it => {
+          const ref = it.number ? `#${it.number} ` : '';
+          const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
+          return `  - ${ref}${it.title}${who}`;
+        }).join('\n');
+        return `${status} (${list.length}):\n${lines}`;
+      }).join('\n\n');
+
+    const prompt = [
+      `Write a concise daily summary for the GitHub project "${title}" (${url}).`,
+      `Cover: total items by status, what's in progress (with owners), any blocked items that need attention, and notable completions.`,
+      `Keep it readable in Telegram — short paragraphs or grouped bullets, no markdown headings.`,
+      ``,
+      `Counts: ${counts}`,
+      `Total items: ${items.length}`,
+      ``,
+      `Items grouped by status:`,
+      detail,
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 1500,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const reply = response.content.map(b => b.text ?? '').join('').trim();
+
+    insertMessage.run(chatId, 'user', `[Project summary requested: ${org}/#${number}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk);
+    }
+  } catch (err) {
+    console.error('Project handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't fetch project board: ${err.message}`);
   }
 });
 
