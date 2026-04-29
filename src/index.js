@@ -367,13 +367,28 @@ bot.onText(/^\/metrics(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
 
   if (arg.toLowerCase() === 'status') {
     try {
-      const res = await fetch(`${DASHBOARD_URL}/api/health`);
-      const body = (await res.text()).trim();
+      const res = await fetch(`${DASHBOARD_URL}/api/summary`);
       if (!res.ok) {
-        await bot.sendMessage(chatId, `Dashboard health check failed: ${res.status} ${res.statusText}\n${body}`);
+        const body = (await res.text()).trim();
+        await bot.sendMessage(chatId, `Dashboard summary failed: ${res.status} ${res.statusText}\n${body}`);
         return;
       }
-      await bot.sendMessage(chatId, `Dashboard is up (${res.status}).\n${body || 'ok'}`);
+      const summary = await res.json();
+      const fmt = (v, suffix = '') => (v === undefined || v === null ? 'n/a' : `${v}${suffix}`);
+      const cycle = summary.averageCycleTime ?? summary.avgCycleTime ?? summary.cycleTime;
+      const cycleStr = cycle === undefined || cycle === null
+        ? 'n/a'
+        : typeof cycle === 'number' ? `${cycle.toFixed(1)}h` : String(cycle);
+      const lines = [
+        'Dashboard summary:',
+        `• Total PRs: ${fmt(summary.totalPRs ?? summary.totalPullRequests)}`,
+        `• Open PRs: ${fmt(summary.openPRs ?? summary.openPullRequests)}`,
+        `• Merged PRs: ${fmt(summary.mergedPRs ?? summary.mergedPullRequests)}`,
+        `• Avg cycle time: ${cycleStr}`,
+        `• Total issues: ${fmt(summary.totalIssues)}`,
+        `• Total deployments: ${fmt(summary.totalDeployments)}`,
+      ];
+      await bot.sendMessage(chatId, lines.join('\n'));
     } catch (err) {
       console.error('Metrics status error:', err);
       await bot.sendMessage(chatId, `Dashboard unreachable: ${err.message}`);
