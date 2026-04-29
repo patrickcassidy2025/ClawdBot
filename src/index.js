@@ -367,23 +367,50 @@ bot.onText(/^\/metrics(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
 
   if (arg.toLowerCase() === 'status') {
     try {
-      const res = await fetch(`${DASHBOARD_URL}/api/summary`);
-      if (!res.ok) {
-        const body = (await res.text()).trim();
-        await bot.sendMessage(chatId, `Dashboard summary failed: ${res.status} ${res.statusText}\n${body}`);
+      const [summaryRes, deploymentsRes] = await Promise.all([
+        fetch(`${DASHBOARD_URL}/api/summary`),
+        fetch(`${DASHBOARD_URL}/api/deployments`),
+      ]);
+
+      if (!summaryRes.ok) {
+        const body = (await summaryRes.text()).trim();
+        await bot.sendMessage(chatId, `Dashboard summary failed: ${summaryRes.status} ${summaryRes.statusText}\n${body}`);
         return;
       }
-      const summary = await res.json();
+
+      const summary = await summaryRes.json();
       const prs = summary.prs ?? {};
       const issues = summary.issues ?? {};
-      const deployments = summary.deployments ?? {};
+
+      let latest = null;
+      if (deploymentsRes.ok) {
+        const deployments = await deploymentsRes.json();
+        const list = Array.isArray(deployments) ? deployments : (deployments?.deployments ?? []);
+        latest = list[0] ?? null;
+      } else {
+        console.error(`Deployments fetch failed: ${deploymentsRes.status} ${deploymentsRes.statusText}`);
+      }
 
       const fmt = (v) => (v === undefined || v === null ? 'n/a' : v);
       const fmtHours = (v) =>
         typeof v === 'number' ? `${v.toFixed(1)}h` : (v == null ? 'n/a' : String(v));
+      const fmtDate = (iso) => {
+        if (!iso) return 'n/a';
+        const d = new Date(iso);
+        if (Number.isNaN(d.getTime())) return String(iso);
+        return d.toLocaleString('en-GB', {
+          day: '2-digit', month: 'short', year: 'numeric',
+          hour: '2-digit', minute: '2-digit',
+          timeZone: 'UTC', timeZoneName: 'short',
+        });
+      };
 
       const lines = [
         'Dashboard summary',
+        '',
+        `Current version: ${fmt(latest?.deployment_id)}`,
+        `Deployed: ${fmtDate(latest?.created_at)}`,
+        `Deployed by: ${fmt(latest?.creator)}`,
         '',
         'Pull requests:',
         `  • Total: ${fmt(prs.total_prs)}`,
@@ -396,11 +423,6 @@ bot.onText(/^\/metrics(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
         `  • Open: ${fmt(issues.open_issues)}`,
         `  • Closed: ${fmt(issues.closed_issues)}`,
         `  • Avg resolution: ${fmtHours(issues.avg_resolution_hours)}`,
-        '',
-        'Deployments:',
-        `  • Total: ${fmt(deployments.total_deployments)}`,
-        `  • Successful: ${fmt(deployments.successful_deployments)}`,
-        `  • Environments: ${fmt(deployments.environments)}`,
       ];
       await bot.sendMessage(chatId, lines.join('\n'));
     } catch (err) {
