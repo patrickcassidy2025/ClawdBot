@@ -1197,8 +1197,8 @@ async function sendDailyBriefing() {
 }
 
 if (process.env.TELEGRAM_NOTIFY_CHAT_ID) {
-  cron.schedule('0 8 * * *', sendDailyBriefing, { timezone: 'Etc/UTC' });
-  console.log('Daily briefing scheduled for 08:00 UTC');
+  cron.schedule('0 4 * * *', sendDailyBriefing, { timezone: 'Etc/UTC' });
+  console.log('Daily briefing scheduled for 04:00 UTC (08:00 Asia/Dubai)');
 } else {
   console.log('Daily briefing disabled (set TELEGRAM_NOTIFY_CHAT_ID to enable).');
 }
