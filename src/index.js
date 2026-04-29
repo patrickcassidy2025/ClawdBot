@@ -834,14 +834,22 @@ async function fetchWeather() {
   return (await res.text()).trim();
 }
 
+async function fetchProjectForBriefing() {
+  const org = process.env.GITHUB_PROJECT_ORG;
+  const number = Number(process.env.GITHUB_PROJECT_NUMBER);
+  if (!org || !Number.isInteger(number)) return null;
+  return fetchProjectItems(org, number);
+}
+
 async function sendDailyBriefing() {
   const notifyId = process.env.TELEGRAM_NOTIFY_CHAT_ID;
   if (!notifyId) return;
 
   try {
-    const [prsByRepo, weather] = await Promise.all([
+    const [prsByRepo, weather, project] = await Promise.all([
       fetchOpenPRs().catch(err => { console.error('PR fetch failed:', err); return []; }),
       fetchWeather().catch(err => { console.error('Weather fetch failed:', err); return 'unavailable'; }),
+      fetchProjectForBriefing().catch(err => { console.error('Project fetch failed:', err); return null; }),
     ]);
 
     const totalPRs = prsByRepo.reduce((n, r) => n + r.prs.length, 0);
@@ -856,19 +864,54 @@ async function sendDailyBriefing() {
         }).join('\n\n')
       : '(no repos configured)';
 
+    let projectSection = '(project board not configured)';
+    if (project && project.items.length) {
+      const byStatus = project.items.reduce((acc, it) => {
+        (acc[it.status] = acc[it.status] || []).push(it);
+        return acc;
+      }, {});
+      const counts = Object.entries(byStatus)
+        .map(([status, list]) => `${status}: ${list.length}`)
+        .join(', ');
+      const formatItem = (it) => {
+        const ref = it.number ? `#${it.number} ` : '';
+        const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
+        return `  - ${ref}${it.title}${who}`;
+      };
+      const inProgress = (byStatus['In Progress'] || []).map(formatItem).join('\n') || '  (none)';
+      const blocked = (byStatus['Blocked'] || []).map(formatItem).join('\n') || '  (none)';
+      projectSection = [
+        `${project.title} — ${project.items.length} items (${counts})`,
+        `In Progress:`,
+        inProgress,
+        `Blocked:`,
+        blocked,
+      ].join('\n');
+    } else if (project) {
+      projectSection = `${project.title} — no items`;
+    }
+
     const prompt = [
-      `Write a friendly morning briefing for Patrick. Keep it warm but concise (5-10 short lines).`,
-      `Start with a greeting and include the weather. Then summarise the open PRs across all repos — group by repo and call out anything notable. End with a small motivational nudge.`,
+      `Write a friendly morning briefing for Patrick. Keep it warm but concise (8-14 short lines).`,
+      `Cover, in this order:`,
+      `1. Greeting + weather`,
+      `2. Open PRs across all repos — group by repo, call out anything notable`,
+      `3. Project board status — totals by status, what's in progress, anything blocked that needs attention`,
+      `4. End with a small motivational nudge`,
+      `No markdown headings. Plain text suitable for Telegram.`,
       ``,
       `Weather: ${weather}`,
       ``,
       `Open PRs across ${prsByRepo.length} repo(s), ${totalPRs} total:`,
       prSummary,
+      ``,
+      `Project board:`,
+      projectSection,
     ].join('\n');
 
     const response = await anthropic.messages.create({
       model: 'claude-opus-4-5',
-      max_tokens: 600,
+      max_tokens: 900,
       system: systemPrompt,
       messages: [{ role: 'user', content: prompt }],
     });
