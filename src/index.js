@@ -374,19 +374,33 @@ bot.onText(/^\/metrics(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
         return;
       }
       const summary = await res.json();
-      const fmt = (v, suffix = '') => (v === undefined || v === null ? 'n/a' : `${v}${suffix}`);
-      const cycle = summary.averageCycleTime ?? summary.avgCycleTime ?? summary.cycleTime;
-      const cycleStr = cycle === undefined || cycle === null
-        ? 'n/a'
-        : typeof cycle === 'number' ? `${cycle.toFixed(1)}h` : String(cycle);
+      const prs = summary.prs ?? {};
+      const issues = summary.issues ?? {};
+      const deployments = summary.deployments ?? {};
+
+      const fmt = (v) => (v === undefined || v === null ? 'n/a' : v);
+      const fmtHours = (v) =>
+        typeof v === 'number' ? `${v.toFixed(1)}h` : (v == null ? 'n/a' : String(v));
+
       const lines = [
-        'Dashboard summary:',
-        `• Total PRs: ${fmt(summary.totalPRs ?? summary.totalPullRequests)}`,
-        `• Open PRs: ${fmt(summary.openPRs ?? summary.openPullRequests)}`,
-        `• Merged PRs: ${fmt(summary.mergedPRs ?? summary.mergedPullRequests)}`,
-        `• Avg cycle time: ${cycleStr}`,
-        `• Total issues: ${fmt(summary.totalIssues)}`,
-        `• Total deployments: ${fmt(summary.totalDeployments)}`,
+        'Dashboard summary',
+        '',
+        'Pull requests:',
+        `  • Total: ${fmt(prs.total_prs)}`,
+        `  • Open: ${fmt(prs.open_prs)}`,
+        `  • Merged: ${fmt(prs.merged_prs)}`,
+        `  • Avg cycle time: ${fmtHours(prs.avg_cycle_time_hours)}`,
+        '',
+        'Issues:',
+        `  • Total: ${fmt(issues.total_issues)}`,
+        `  • Open: ${fmt(issues.open_issues)}`,
+        `  • Closed: ${fmt(issues.closed_issues)}`,
+        `  • Avg resolution: ${fmtHours(issues.avg_resolution_hours)}`,
+        '',
+        'Deployments:',
+        `  • Total: ${fmt(deployments.total_deployments)}`,
+        `  • Successful: ${fmt(deployments.successful_deployments)}`,
+        `  • Environments: ${fmt(deployments.environments)}`,
       ];
       await bot.sendMessage(chatId, lines.join('\n'));
     } catch (err) {
