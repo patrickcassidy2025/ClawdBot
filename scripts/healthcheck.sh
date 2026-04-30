@@ -6,7 +6,7 @@ echo "==> Clawdbot healthcheck"
 echo
 echo "[1] Basic files"
 test -f .env && echo "OK: .env present" || echo "WARN: .env missing"
-test -f config/openclaw.jsonc && echo "OK: config/openclaw.jsonc present" || echo "WARN: config/openclaw.jsonc missing"
+test -f src/index.js && echo "OK: src/index.js present" || echo "WARN: src/index.js missing"
 
 echo
 echo "[2] Tools"
