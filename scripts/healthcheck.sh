@@ -17,6 +17,7 @@ echo
 echo "[3] Service status"
 if command -v systemctl >/dev/null 2>&1; then
   systemctl is-active --quiet clawdbot && echo "OK: clawdbot service active" || echo "WARN: clawdbot service not active"
+  systemctl is-active --quiet delivery-intelligence && echo "OK: delivery-intelligence service active" || echo "WARN: delivery-intelligence service not active"
 else
   echo "WARN: systemctl not available"
 fi
@@ -24,7 +25,8 @@ fi
 echo
 echo "[4] Port check"
 if command -v ss >/dev/null 2>&1; then
-  ss -ltnp | grep ":8080" >/dev/null 2>&1 && echo "OK: port 8080 listening" || echo "WARN: port 8080 not listening"
+  ss -ltnp | grep ":3001" >/dev/null 2>&1 && echo "OK: port 3001 listening (clawdbot webhook)" || echo "WARN: port 3001 not listening (clawdbot webhook)"
+  ss -ltnp | grep ":3000" >/dev/null 2>&1 && echo "OK: port 3000 listening (delivery-intelligence)" || echo "WARN: port 3000 not listening (delivery-intelligence)"
 fi
 
 echo
