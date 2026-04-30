@@ -602,6 +602,7 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       }).join('\n\n');
 
     const prompt = [
+      `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
       `Write a concise daily summary for the GitHub project "${title}" (${url}).`,
       `Cover: total items by status, what's in progress (with owners), any blocked items that need attention, and notable completions.`,
       `Keep it readable in Telegram — short paragraphs or grouped bullets, no markdown headings.`,
