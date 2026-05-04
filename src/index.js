@@ -579,14 +579,13 @@ async function fetchProjectItems(org, number) {
   return { items, ...projectMeta };
 }
 
+const COMPLETED_STATUSES = new Set(['done', "won't do", 'cancelled', 'closed']);
+
 function isBlocker(item) {
   const status = (item.status || '').toLowerCase();
-  if (status === 'blocked' || status === 'on-hold' || status === 'on hold') return true;
+  if (COMPLETED_STATUSES.has(status)) return false;
   const priority = (item.priority || '').toLowerCase();
-  if (priority.includes('blocker') || priority.includes('critical')) return true;
-  const title = (item.title || '').toLowerCase();
-  if (/\bblocker\b/.test(title)) return true;
-  return false;
+  return priority === 'blocker';
 }
 
 bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
@@ -640,7 +639,7 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
       `Write a concise daily summary for the GitHub project "${title}" (${url}).`,
       `Cover: total items by status, what's in progress (with owners), any blocked items that need attention, and notable completions.`,
-      `An item counts as a blocker if its status is Blocked/On-Hold, its priority is Blocker/Critical, or its title mentions "blocker". Use the explicit Blockers list below as the source of truth — don't infer additional ones.`,
+      `An item counts as a blocker only if its priority is "Blocker" and its status is not Done/Won't do/Cancelled/Closed. Use the explicit Blockers list below as the source of truth — don't infer additional ones.`,
       `Keep it readable in Telegram — short paragraphs or grouped bullets, no markdown headings.`,
       ``,
       `Counts: ${counts}`,
@@ -1211,7 +1210,7 @@ async function sendDailyBriefing() {
       `Cover, in this order:`,
       `1. Greeting`,
       `2. Open PRs across all repos — group by repo, call out anything notable`,
-      `3. Project board status — totals by status, what's in progress, anything blocked that needs attention. An item counts as a blocker if its status is Blocked/On-Hold, its priority is Blocker/Critical, or its title mentions "blocker".`,
+      `3. Project board status — totals by status, what's in progress, anything blocked that needs attention. An item counts as a blocker only if its priority is "Blocker" and its status is not Done/Won't do/Cancelled/Closed.`,
       `4. End with a small motivational nudge`,
       `No markdown headings. Plain text suitable for Telegram.`,
       ``,
