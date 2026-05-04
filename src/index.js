@@ -533,6 +533,7 @@ async function githubGraphQL(query, variables) {
 
 async function fetchProjectItems(org, number) {
   const items = [];
+  const fieldNamesSeen = new Set();
   let after = null;
   let projectMeta = null;
   while (true) {
@@ -543,9 +544,18 @@ async function fetchProjectItems(org, number) {
     for (const node of project.items.nodes) {
       const content = node.content;
       if (!content) continue;
+      for (const v of node.fieldValues.nodes) {
+        if (v.field?.name) fieldNamesSeen.add(v.field.name);
+      }
       const statusNode = node.fieldValues.nodes.find(
         v => v.__typename === 'ProjectV2ItemFieldSingleSelectValue' && v.field?.name === 'Status'
       );
+      const priorityNode = node.fieldValues.nodes.find(
+        v => /^priority$/i.test(v.field?.name || '') &&
+          (v.__typename === 'ProjectV2ItemFieldSingleSelectValue' ||
+            v.__typename === 'ProjectV2ItemFieldTextValue')
+      );
+      const priority = priorityNode?.name ?? priorityNode?.text ?? null;
       items.push({
         title: content.title,
         type: content.__typename,
@@ -554,12 +564,29 @@ async function fetchProjectItems(org, number) {
         state: content.state ?? null,
         assignees: content.assignees?.nodes?.map(a => a.login) || [],
         status: statusNode?.name || 'No status',
+        priority,
       });
     }
     if (!project.items.pageInfo.hasNextPage) break;
     after = project.items.pageInfo.endCursor;
   }
+  const priorityValues = [...new Set(items.map(it => it.priority).filter(Boolean))];
+  console.log(
+    `[fetchProjectItems] ${org}/#${number}: ${items.length} items; ` +
+      `field names seen: [${[...fieldNamesSeen].join(', ') || 'none'}]; ` +
+      `priority values: [${priorityValues.join(', ') || 'none'}]`
+  );
   return { items, ...projectMeta };
+}
+
+function isBlocker(item) {
+  const status = (item.status || '').toLowerCase();
+  if (status === 'blocked' || status === 'on-hold' || status === 'on hold') return true;
+  const priority = (item.priority || '').toLowerCase();
+  if (priority.includes('blocker') || priority.includes('critical')) return true;
+  const title = (item.title || '').toLowerCase();
+  if (/\bblocker\b/.test(title)) return true;
+  return false;
 }
 
 bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
@@ -591,24 +618,36 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       .map(([status, list]) => `${status}: ${list.length}`)
       .join(', ');
 
+    const formatItem = (it) => {
+      const ref = it.number ? `#${it.number} ` : '';
+      const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
+      const pri = it.priority ? ` [priority: ${it.priority}]` : '';
+      return `  - ${ref}${it.title}${who}${pri}`;
+    };
+
     const detail = Object.entries(byStatus)
       .map(([status, list]) => {
-        const lines = list.map(it => {
-          const ref = it.number ? `#${it.number} ` : '';
-          const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
-          return `  - ${ref}${it.title}${who}`;
-        }).join('\n');
+        const lines = list.map(formatItem).join('\n');
         return `${status} (${list.length}):\n${lines}`;
       }).join('\n\n');
+
+    const blockers = items.filter(isBlocker);
+    const blockersSection = blockers.length
+      ? blockers.map(formatItem).join('\n')
+      : '(none)';
 
     const prompt = [
       `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
       `Write a concise daily summary for the GitHub project "${title}" (${url}).`,
       `Cover: total items by status, what's in progress (with owners), any blocked items that need attention, and notable completions.`,
+      `An item counts as a blocker if its status is Blocked/On-Hold, its priority is Blocker/Critical, or its title mentions "blocker". Use the explicit Blockers list below as the source of truth — don't infer additional ones.`,
       `Keep it readable in Telegram — short paragraphs or grouped bullets, no markdown headings.`,
       ``,
       `Counts: ${counts}`,
       `Total items: ${items.length}`,
+      ``,
+      `Blockers (${blockers.length}):`,
+      blockersSection,
       ``,
       `Items grouped by status:`,
       detail,
@@ -659,14 +698,15 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
     );
 
     const inProgress = project ? project.items.filter(it => it.status === 'In Progress') : [];
-    const blocked = project ? project.items.filter(it => it.status === 'Blocked') : [];
+    const blocked = project ? project.items.filter(isBlocker) : [];
 
     const formatPR = (p) =>
       `  - ${p.repo}#${p.number}${p.draft ? ' (draft)' : ''} ${p.title}`;
     const formatItem = (it) => {
       const ref = it.number ? `#${it.number} ` : '';
       const who = it.assignees.length ? ` (@${it.assignees.join(', @')})` : '';
-      return `  - ${ref}${it.title}${who}`;
+      const pri = it.priority ? ` [priority: ${it.priority}]` : '';
+      return `  - ${ref}${it.title}${who}${pri}`;
     };
 
     const prompt = [
@@ -1121,9 +1161,8 @@ async function sendDailyBriefing() {
   if (!notifyId) return;
 
   try {
-    const [prsByRepo, weather, project] = await Promise.all([
+    const [prsByRepo, project] = await Promise.all([
       fetchOpenPRs().catch(err => { console.error('PR fetch failed:', err); return []; }),
-      fetchWeather().catch(err => { console.error('Weather fetch failed:', err); return 'unavailable'; }),
       fetchProjectForBriefing().catch(err => { console.error('Project fetch failed:', err); return null; }),
     ]);
 
@@ -1151,10 +1190,11 @@ async function sendDailyBriefing() {
       const formatItem = (it) => {
         const ref = it.number ? `#${it.number} ` : '';
         const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
-        return `  - ${ref}${it.title}${who}`;
+        const pri = it.priority ? ` [priority: ${it.priority}]` : '';
+        return `  - ${ref}${it.title}${who}${pri}`;
       };
       const inProgress = (byStatus['In Progress'] || []).map(formatItem).join('\n') || '  (none)';
-      const blocked = (byStatus['Blocked'] || []).map(formatItem).join('\n') || '  (none)';
+      const blocked = project.items.filter(isBlocker).map(formatItem).join('\n') || '  (none)';
       projectSection = [
         `${project.title} — ${project.items.length} items (${counts})`,
         `In Progress:`,
@@ -1169,13 +1209,11 @@ async function sendDailyBriefing() {
     const prompt = [
       `Write a friendly morning briefing for Patrick. Keep it warm but concise (8-14 short lines).`,
       `Cover, in this order:`,
-      `1. Greeting + weather`,
+      `1. Greeting`,
       `2. Open PRs across all repos — group by repo, call out anything notable`,
-      `3. Project board status — totals by status, what's in progress, anything blocked that needs attention`,
+      `3. Project board status — totals by status, what's in progress, anything blocked that needs attention. An item counts as a blocker if its status is Blocked/On-Hold, its priority is Blocker/Critical, or its title mentions "blocker".`,
       `4. End with a small motivational nudge`,
       `No markdown headings. Plain text suitable for Telegram.`,
-      ``,
-      `Weather: ${weather}`,
       ``,
       `Open PRs across ${prsByRepo.length} repo(s), ${totalPRs} total:`,
       prSummary,
