@@ -476,6 +476,7 @@ const PROJECT_ITEMS_QUERY = `
           pageInfo { hasNextPage endCursor }
           nodes {
             type
+            updatedAt
             content {
               __typename
               ... on Issue {
@@ -565,6 +566,7 @@ async function fetchProjectItems(org, number) {
         assignees: content.assignees?.nodes?.map(a => a.login) || [],
         status: statusNode?.name || 'No status',
         priority,
+        updatedAt: node.updatedAt ?? null,
       });
     }
     if (!project.items.pageInfo.hasNextPage) break;
@@ -586,6 +588,35 @@ function isBlocker(item) {
   if (COMPLETED_STATUSES.has(status)) return false;
   const priority = (item.priority || '').toLowerCase();
   return priority === 'blocker';
+}
+
+const STAGE_LENGTH_MS = 14 * 24 * 60 * 60 * 1000;
+const STAGE_REFERENCE_NUMBER = 8;
+const STAGE_REFERENCE_START_UTC = Date.UTC(2026, 3, 26);
+
+function getCurrentStage(now = new Date()) {
+  const offset = now.getTime() - STAGE_REFERENCE_START_UTC;
+  const stagesElapsed = Math.floor(offset / STAGE_LENGTH_MS);
+  const number = STAGE_REFERENCE_NUMBER + stagesElapsed;
+  const startUtc = STAGE_REFERENCE_START_UTC + stagesElapsed * STAGE_LENGTH_MS;
+  const endUtc = startUtc + STAGE_LENGTH_MS;
+  const fmt = (ms) => new Date(ms).toLocaleDateString('en-GB', {
+    day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
+  });
+  return {
+    number,
+    label: `Stage ${String(number).padStart(2, '0')}`,
+    startUtc,
+    endUtc,
+    rangeLabel: `${fmt(startUtc)} – ${fmt(endUtc - 1)}`,
+  };
+}
+
+function isCompletedInStage(item, stage) {
+  if ((item.status || '').toLowerCase() !== 'done') return false;
+  if (!item.updatedAt) return false;
+  const t = new Date(item.updatedAt).getTime();
+  return Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc;
 }
 
 bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
@@ -635,11 +666,19 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       ? blockers.map(formatItem).join('\n')
       : '(none)';
 
+    const stage = getCurrentStage();
+    const completedThisStage = items.filter(it => isCompletedInStage(it, stage));
+    const completedSection = completedThisStage.length
+      ? completedThisStage.map(formatItem).join('\n')
+      : '(none)';
+
     const prompt = [
       `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
+      `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
       `Write a concise daily summary for the GitHub project "${title}" (${url}).`,
-      `Cover: total items by status, what's in progress (with owners), any blocked items that need attention, and notable completions.`,
+      `Cover: total items by status, what's in progress (with owners), any blocked items that need attention, and a "Completed this stage (${stage.label})" callout that reports the count and titles as a velocity signal.`,
       `An item counts as a blocker only if its priority is "Blocker" and its status is not Done/Won't do/Cancelled/Closed. Use the explicit Blockers list below as the source of truth — don't infer additional ones.`,
+      `Reference the stage number and date range when discussing completions.`,
       `Keep it readable in Telegram — short paragraphs or grouped bullets, no markdown headings.`,
       ``,
       `Counts: ${counts}`,
@@ -647,6 +686,9 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       ``,
       `Blockers (${blockers.length}):`,
       blockersSection,
+      ``,
+      `Completed this stage — ${stage.label}, ${stage.rangeLabel} (${completedThisStage.length}):`,
+      completedSection,
       ``,
       `Items grouped by status:`,
       detail,
@@ -698,6 +740,10 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
 
     const inProgress = project ? project.items.filter(it => it.status === 'In Progress') : [];
     const blocked = project ? project.items.filter(isBlocker) : [];
+    const stage = getCurrentStage();
+    const completedThisStage = project
+      ? project.items.filter(it => isCompletedInStage(it, stage))
+      : [];
 
     const formatPR = (p) =>
       `  - ${p.repo}#${p.number}${p.draft ? ' (draft)' : ''} ${p.title}`;
@@ -710,10 +756,12 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
 
     const prompt = [
       `Write a daily standup update for Patrick that can be pasted directly into Slack or Teams.`,
-      `Use exactly these three sections, in this order, with the bold labels shown:`,
+      `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
+      `Use exactly these four sections, in this order, with the bold labels shown:`,
       `**Yesterday** — derive from PRs updated in the last 24 hours.`,
       `**Today** — derive from in-progress project board items and open PRs.`,
       `**Blockers** — list blocked project board items, or write "None" if there are none.`,
+      `**Completed this stage (${stage.label})** — list titles completed in the current stage as a velocity signal, or write "None" if empty. Mention the stage date range once.`,
       `Tight bullets only. No preamble, no sign-off, no emoji, professional tone.`,
       ``,
       `=== PRs updated in the last 24 hours ===`,
@@ -727,6 +775,9 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
       ``,
       `=== Project board: Blocked ===`,
       blocked.length ? blocked.map(formatItem).join('\n') : '(none)',
+      ``,
+      `=== Project board: Completed this stage (${stage.label}, ${stage.rangeLabel}) ===`,
+      completedThisStage.length ? completedThisStage.map(formatItem).join('\n') : '(none)',
     ].join('\n');
 
     const response = await anthropic.messages.create({
@@ -1177,6 +1228,8 @@ async function sendDailyBriefing() {
         }).join('\n\n')
       : '(no repos configured)';
 
+    const stage = getCurrentStage();
+
     let projectSection = '(project board not configured)';
     if (project && project.items.length) {
       const byStatus = project.items.reduce((acc, it) => {
@@ -1194,24 +1247,32 @@ async function sendDailyBriefing() {
       };
       const inProgress = (byStatus['In Progress'] || []).map(formatItem).join('\n') || '  (none)';
       const blocked = project.items.filter(isBlocker).map(formatItem).join('\n') || '  (none)';
+      const completedThisStage = project.items.filter(it => isCompletedInStage(it, stage));
+      const completed = completedThisStage.length
+        ? completedThisStage.map(formatItem).join('\n')
+        : '  (none)';
       projectSection = [
         `${project.title} — ${project.items.length} items (${counts})`,
         `In Progress:`,
         inProgress,
         `Blocked:`,
         blocked,
+        `Completed this stage — ${stage.label}, ${stage.rangeLabel} (${completedThisStage.length}):`,
+        completed,
       ].join('\n');
     } else if (project) {
       projectSection = `${project.title} — no items`;
     }
 
     const prompt = [
-      `Write a friendly morning briefing for Patrick. Keep it warm but concise (8-14 short lines).`,
+      `Write a friendly morning briefing for Patrick. Keep it warm but concise (10-16 short lines).`,
+      `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
       `Cover, in this order:`,
       `1. Greeting`,
       `2. Open PRs across all repos — group by repo, call out anything notable`,
       `3. Project board status — totals by status, what's in progress, anything blocked that needs attention. An item counts as a blocker only if its priority is "Blocker" and its status is not Done/Won't do/Cancelled/Closed.`,
-      `4. End with a small motivational nudge`,
+      `4. Velocity for the current stage: report a "Completed this stage (${stage.label})" line with the count and titles, and reference the stage date range once.`,
+      `5. End with a small motivational nudge`,
       `No markdown headings. Plain text suitable for Telegram.`,
       ``,
       `Open PRs across ${prsByRepo.length} repo(s), ${totalPRs} total:`,
