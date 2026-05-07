@@ -482,6 +482,7 @@ const PROJECT_ITEMS_QUERY = `
           pageInfo { hasNextPage endCursor }
           nodes {
             type
+            createdAt
             updatedAt
             content {
               __typename
@@ -573,6 +574,7 @@ async function fetchProjectItems(org, number) {
         status: statusNode?.name || 'No status',
         priority,
         updatedAt: node.updatedAt ?? null,
+        createdAt: node.createdAt ?? null,
       });
     }
     if (!project.items.pageInfo.hasNextPage) break;
@@ -840,18 +842,21 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
     const blockers = items.filter(isBlocker);
 
     const untouched = items.filter(it => {
-      if ((it.status || '').toLowerCase() === 'done') return false;
-      if (!it.updatedAt) return false;
-      const t = new Date(it.updatedAt).getTime();
-      return Number.isFinite(t) && t < stage.startUtc;
+      const status = (it.status || '').toLowerCase();
+      if (status === 'done' || status === "won't do" || status === 'cancelled') return false;
+      if (!it.updatedAt || !it.createdAt) return false;
+      const updT = new Date(it.updatedAt).getTime();
+      const crT = new Date(it.createdAt).getTime();
+      if (!Number.isFinite(updT) || !Number.isFinite(crT)) return false;
+      return updT < stage.startUtc && crT < stage.startUtc;
     });
+    const untouchedSorted = [...untouched].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+    const untouchedDisplay = untouchedSorted.slice(0, 20);
 
-    const doneOutsideStage = items.filter(it => {
-      if ((it.status || '').toLowerCase() !== 'done') return false;
-      if (!it.updatedAt) return false;
-      const t = new Date(it.updatedAt).getTime();
-      return Number.isFinite(t) && (t < stage.startUtc || t >= stage.endUtc);
-    });
+    const completedDisplay = completed.slice(0, 30);
+    const blockersDisplay = blockers.slice(0, 30);
 
     const totalActive = items.filter(it => {
       const status = (it.status || '').toLowerCase();
@@ -881,20 +886,21 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
     const formatStale = (it) => {
       const ref = it.number ? `#${it.number} ` : '';
       const last = it.updatedAt ? new Date(it.updatedAt).toISOString().slice(0, 10) : 'unknown';
+      const created = it.createdAt ? new Date(it.createdAt).toISOString().slice(0, 10) : 'unknown';
       const status = it.status || 'No status';
-      return `  - ${ref}${it.title} (status: ${status}, last updated: ${last})`;
+      return `  - ${ref}${it.title} (status: ${status}, created: ${created}, last updated: ${last})`;
     };
 
-    const formatDoneOutside = (it) => {
-      const ref = it.number ? `#${it.number} ` : '';
-      const last = it.updatedAt ? new Date(it.updatedAt).toISOString().slice(0, 10) : 'unknown';
-      return `  - ${ref}${it.title} (completed: ${last})`;
-    };
-
+    const stageStartIso = new Date(stage.startUtc).toISOString().slice(0, 10);
     const prompt = [
       `Write a sprint retrospective for the GitHub project "${title}" (${url}).`,
       `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
       `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
+      ``,
+      `IMPORTANT SCOPE: This retrospective is ONLY about ${stage.label} (${stage.rangeLabel}).`,
+      `Do not reference, speculate about, or analyse historical items outside this stage's date range`,
+      `except where they appear explicitly in the data sections below. Treat the board's long-term backlog`,
+      `as out of scope — focus on what happened in ${stage.label} and what is currently active.`,
       ``,
       `Write this as a narrative retrospective — not just bullet points — suitable for sharing with a team lead or stakeholder.`,
       `Use exactly these six sections in order, with the bold labels shown:`,
@@ -902,8 +908,8 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
       `**Stage summary** — name the current stage, date range, total items, and the headline completion rate.`,
       `**What we completed** — narrative of key themes from items completed this stage. Group by component or theme where the titles suggest one. Highlight what shipped, not just a list.`,
       `**Blockers and concerns** — for each blocker, mention title, assignee, priority, and how long it has been in its current status. Comment on what the blocker pattern suggests.`,
-      `**Untouched items** — stale items that haven't been touched since the stage began. List titles and last-updated dates and note whether they look forgotten.`,
-      `**Done but not staged** — items completed in a previous stage that are still on the board. Flag as housekeeping that should be archived.`,
+      `**Untouched items** — stale items that existed before the stage began and haven't been touched since. List titles and dates and note whether they look forgotten.`,
+      `**Velocity trend** — note items completed this stage and the simple ratio of total items on the board vs total Done overall. Brief comment on what the ratio suggests, no historical speculation.`,
       `**Overall health assessment** — a brief RAG status (Red, Amber, or Green) followed by a one-paragraph narrative on overall sprint health, weighing completion rate, blockers, and stale items.`,
       ``,
       `Tone: honest, direct, professional. Plain text suitable for Telegram — short paragraphs, no markdown headings beyond the bold section labels above.`,
@@ -916,17 +922,19 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
       `Done items: ${doneCount}`,
       `Headline completion rate (Done / total active): ${completionRate}`,
       ``,
-      `=== What we completed — Done items updated within ${stage.label} (${completed.length}) ===`,
-      completed.length ? completed.map(formatItem).join('\n') : '(none)',
+      `=== What we completed — Done items updated within ${stage.label} (${completed.length}${completed.length > completedDisplay.length ? `, showing first ${completedDisplay.length}` : ''}) ===`,
+      completedDisplay.length ? completedDisplay.map(formatItem).join('\n') : '(none)',
       ``,
-      `=== Blockers and concerns (${blockers.length}) ===`,
-      blockers.length ? blockers.map(formatBlocker).join('\n') : '(none)',
+      `=== Blockers and concerns (${blockers.length}${blockers.length > blockersDisplay.length ? `, showing first ${blockersDisplay.length}` : ''}) ===`,
+      blockersDisplay.length ? blockersDisplay.map(formatBlocker).join('\n') : '(none)',
       ``,
-      `=== Untouched items — not Done and not updated since stage start ${new Date(stage.startUtc).toISOString().slice(0,10)} (${untouched.length}) ===`,
-      untouched.length ? untouched.map(formatStale).join('\n') : '(none)',
+      `=== Untouched items — not Done/Won't do/Cancelled, created before ${stageStartIso} and not updated since (${untouched.length} total${untouched.length > untouchedDisplay.length ? `, showing 20 most recently created` : ''}) ===`,
+      untouchedDisplay.length ? untouchedDisplay.map(formatStale).join('\n') : '(none)',
       ``,
-      `=== Done but not staged — Done items completed outside ${stage.label} date range (${doneOutsideStage.length}) ===`,
-      doneOutsideStage.length ? doneOutsideStage.map(formatDoneOutside).join('\n') : '(none)',
+      `=== Velocity trend ===`,
+      `Items completed in ${stage.label}: ${completed.length}`,
+      `Total items on board (all stages): ${items.length}`,
+      `Total Done items overall: ${doneCount}`,
     ].join('\n');
 
     const response = await anthropic.messages.create({
