@@ -892,14 +892,26 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
     const completedDisplay = completed.slice(0, 30);
     const blockersDisplay = blockers.slice(0, 30);
 
-    const totalActive = items.filter(it => {
-      const status = (it.status || '').toLowerCase();
-      return status !== "won't do" && status !== 'cancelled' && status !== 'closed';
-    }).length;
-    const doneCount = items.filter(it => (it.status || '').toLowerCase() === 'done').length;
-    const completionRate = totalActive > 0
-      ? `${Math.round((doneCount / totalActive) * 100)}% (${doneCount}/${totalActive})`
+    const updatedInStage = (it) => {
+      if (!it.updatedAt) return false;
+      const t = new Date(it.updatedAt).getTime();
+      return Number.isFinite(t) && t >= stage.startUtc;
+    };
+    const inProgressThisStage = items.filter(it => it.status === 'In Progress' && updatedInStage(it));
+    const inReviewThisStage = items.filter(it => it.status === 'In Review' && updatedInStage(it));
+    const blockersThisStage = items.filter(it => isBlocker(it) && updatedInStage(it));
+    const activeSet = new Set([
+      ...inProgressThisStage,
+      ...inReviewThisStage,
+      ...blockersThisStage,
+      ...untouched,
+    ]);
+    const activeThisStage = activeSet.size;
+    const stageTotal = completed.length + activeThisStage;
+    const stageCompletionRate = stageTotal > 0
+      ? `${Math.round((completed.length / stageTotal) * 100)}% (${completed.length}/${stageTotal})`
       : 'n/a';
+    const doneCount = items.filter(it => (it.status || '').toLowerCase() === 'done').length;
 
     const formatItem = (it) => {
       const ref = it.number ? `#${it.number} ` : '';
@@ -925,47 +937,52 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
       return `  - ${ref}${it.title} (status: ${status}, created: ${created}, last updated: ${last})`;
     };
 
-    const stageStartIso = new Date(stage.startUtc).toISOString().slice(0, 10);
+    const fmtUtcDate = (ms) => new Date(ms).toLocaleDateString('en-GB', {
+      day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
+    });
+    const stageStartLabel = fmtUtcDate(stage.startUtc);
+    const stageEndLabel = fmtUtcDate(stage.endUtc - 1);
+    const stageHeader = `${stage.label} (${stage.rangeLabel})`;
     const prompt = [
       `Write a sprint retrospective for the GitHub project "${title}" (${url}).`,
       `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
-      `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
+      `Current sprint: ${stageHeader}.`,
       ``,
-      `IMPORTANT SCOPE: This retrospective is ONLY about ${stage.label} (${stage.rangeLabel}).`,
+      `IMPORTANT SCOPE: This retrospective is ONLY about ${stageHeader}.`,
       `Do not reference, speculate about, or analyse historical items outside this stage's date range`,
       `except where they appear explicitly in the data sections below. Treat the board's long-term backlog`,
       `as out of scope — focus on what happened in ${stage.label} and what is currently active.`,
+      `Use the exact stage window dates supplied in each section heading below — do not infer or guess dates.`,
       ``,
       `Write this as a narrative retrospective — not just bullet points — suitable for sharing with a team lead or stakeholder.`,
       `Use exactly these six sections in order, with the bold labels shown:`,
       ``,
-      `**Stage summary** — name the current stage, date range, total items, and the headline completion rate.`,
-      `**What we completed** — narrative of key themes from items completed this stage. Group by component or theme where the titles suggest one. Highlight what shipped, not just a list.`,
-      `**Blockers and concerns** — for each blocker, mention title, assignee, priority, and how long it has been in its current status. Comment on what the blocker pattern suggests.`,
-      `**Untouched items** — stale items that existed before the stage began and haven't been touched since. List titles and dates and note whether they look forgotten.`,
-      `**Velocity trend** — note items completed this stage and the simple ratio of total items on the board vs total Done overall. Brief comment on what the ratio suggests, no historical speculation.`,
+      `**Stage summary** — name ${stageHeader}, items completed this stage, items active this stage, and the stage completion rate. Do NOT cite total board items or total Done across all stages — use only the stage-scoped numbers provided.`,
+      `**What we completed** — narrative of key themes from items completed during ${stageHeader}. Group by component or theme where the titles suggest one. Highlight what shipped, not just a list.`,
+      `**Blockers and concerns** — for each blocker active in ${stageHeader}, mention title, assignee, priority, and how long it has been in its current status. Comment on what the blocker pattern suggests.`,
+      `**Untouched items** — stale items that existed before ${stageStartLabel} and haven't been touched since the stage began. List titles and dates and note whether they look forgotten.`,
+      `**Velocity trend** — for ${stageHeader}, note items completed this stage and the simple ratio of total items on the board vs total Done overall. Brief comment on what the ratio suggests, no historical speculation.`,
       `**Overall health assessment** — a brief RAG status (Red, Amber, or Green) followed by a one-paragraph narrative on overall sprint health, weighing completion rate, blockers, and stale items.`,
       ``,
       `Tone: honest, direct, professional. Plain text suitable for Telegram — short paragraphs, no markdown headings beyond the bold section labels above.`,
       ``,
-      `=== Stage summary data ===`,
+      `=== Stage summary (${stageHeader}) ===`,
       `Stage: ${stage.label} (number ${stage.number})`,
-      `Date range: ${stage.rangeLabel}`,
-      `Total items on board: ${items.length}`,
-      `Total active items (excluding Won't do / Cancelled / Closed): ${totalActive}`,
-      `Done items: ${doneCount}`,
-      `Headline completion rate (Done / total active): ${completionRate}`,
+      `Stage window: ${stageStartLabel} – ${stageEndLabel}`,
+      `Items completed during ${stage.label}: ${completed.length}`,
+      `Items active in ${stage.label} (In Progress + In Review + Blockers + untouched, deduplicated): ${activeThisStage}`,
+      `Stage completion rate (completed / (completed + active)): ${stageCompletionRate}`,
       ``,
-      `=== What we completed — Done items updated within ${stage.label} (${completed.length}${completed.length > completedDisplay.length ? `, showing first ${completedDisplay.length}` : ''}) ===`,
+      `=== Completed during ${stageHeader} (${completed.length}${completed.length > completedDisplay.length ? `, showing first ${completedDisplay.length}` : ''}) ===`,
       completedDisplay.length ? completedDisplay.map(formatItem).join('\n') : '(none)',
       ``,
-      `=== Blockers and concerns (${blockers.length}${blockers.length > blockersDisplay.length ? `, showing first ${blockersDisplay.length}` : ''}) ===`,
+      `=== Blockers and concerns during ${stageHeader} (${blockers.length}${blockers.length > blockersDisplay.length ? `, showing first ${blockersDisplay.length}` : ''}) ===`,
       blockersDisplay.length ? blockersDisplay.map(formatBlocker).join('\n') : '(none)',
       ``,
-      `=== Untouched items — not Done/Won't do/Cancelled, created before ${stageStartIso} and not updated since (${untouched.length} total${untouched.length > untouchedDisplay.length ? `, showing 20 most recently created` : ''}) ===`,
+      `=== Not updated since stage start (${stageStartLabel}) — created before stage start, status not Done/Won't do/Cancelled (${untouched.length} total${untouched.length > untouchedDisplay.length ? `, showing 20 most recently created` : ''}) ===`,
       untouchedDisplay.length ? untouchedDisplay.map(formatStale).join('\n') : '(none)',
       ``,
-      `=== Velocity trend ===`,
+      `=== ${stage.label} velocity (${stage.rangeLabel}) ===`,
       `Items completed in ${stage.label}: ${completed.length}`,
       `Total items on board (all stages): ${items.length}`,
       `Total Done items overall: ${doneCount}`,
