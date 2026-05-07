@@ -130,6 +130,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/metrics status — check if the dashboard is running',
     '/project — daily summary of the Presight-AI GitHub project board',
     '/standup — generate a yesterday/today/blockers standup update',
+    '/retrospective — sprint retrospective for the current stage',
     '/ask <question> — natural-language Q&A over recent GitHub activity',
     '',
     'You can also send me:',
@@ -802,6 +803,149 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
   } catch (err) {
     console.error('Standup handler error:', err);
     await bot.sendMessage(chatId, `Couldn't generate standup: ${err.message}`);
+  }
+});
+
+bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+
+  const org = process.env.GITHUB_PROJECT_ORG;
+  const number = Number(process.env.GITHUB_PROJECT_NUMBER);
+  if (!org || !Number.isInteger(number)) {
+    await bot.sendMessage(chatId, 'Project board not configured: set GITHUB_PROJECT_ORG and GITHUB_PROJECT_NUMBER.');
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+    const { items, title, url } = await fetchProjectItems(org, number);
+
+    if (!items.length) {
+      await bot.sendMessage(chatId, `Project "${title}" has no items.`);
+      return;
+    }
+
+    const stage = getCurrentStage();
+    const now = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    const daysSince = (iso) => {
+      if (!iso) return null;
+      const t = new Date(iso).getTime();
+      if (!Number.isFinite(t)) return null;
+      return Math.floor((now - t) / DAY_MS);
+    };
+
+    const completed = items.filter(it => isCompletedInStage(it, stage));
+    const blockers = items.filter(isBlocker);
+
+    const untouched = items.filter(it => {
+      if ((it.status || '').toLowerCase() === 'done') return false;
+      if (!it.updatedAt) return false;
+      const t = new Date(it.updatedAt).getTime();
+      return Number.isFinite(t) && t < stage.startUtc;
+    });
+
+    const doneOutsideStage = items.filter(it => {
+      if ((it.status || '').toLowerCase() !== 'done') return false;
+      if (!it.updatedAt) return false;
+      const t = new Date(it.updatedAt).getTime();
+      return Number.isFinite(t) && (t < stage.startUtc || t >= stage.endUtc);
+    });
+
+    const totalActive = items.filter(it => {
+      const status = (it.status || '').toLowerCase();
+      return status !== "won't do" && status !== 'cancelled' && status !== 'closed';
+    }).length;
+    const doneCount = items.filter(it => (it.status || '').toLowerCase() === 'done').length;
+    const completionRate = totalActive > 0
+      ? `${Math.round((doneCount / totalActive) * 100)}% (${doneCount}/${totalActive})`
+      : 'n/a';
+
+    const formatItem = (it) => {
+      const ref = it.number ? `#${it.number} ` : '';
+      const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
+      const pri = it.priority ? ` [priority: ${it.priority}]` : '';
+      return `  - ${ref}${it.title}${who}${pri}`;
+    };
+
+    const formatBlocker = (it) => {
+      const ref = it.number ? `#${it.number} ` : '';
+      const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : ' — (unassigned)';
+      const pri = it.priority ? ` [priority: ${it.priority}]` : ' [priority: unset]';
+      const d = daysSince(it.updatedAt);
+      const age = d === null ? '' : ` (in current status for ${d} day${d === 1 ? '' : 's'})`;
+      return `  - ${ref}${it.title}${who}${pri}${age}`;
+    };
+
+    const formatStale = (it) => {
+      const ref = it.number ? `#${it.number} ` : '';
+      const last = it.updatedAt ? new Date(it.updatedAt).toISOString().slice(0, 10) : 'unknown';
+      const status = it.status || 'No status';
+      return `  - ${ref}${it.title} (status: ${status}, last updated: ${last})`;
+    };
+
+    const formatDoneOutside = (it) => {
+      const ref = it.number ? `#${it.number} ` : '';
+      const last = it.updatedAt ? new Date(it.updatedAt).toISOString().slice(0, 10) : 'unknown';
+      return `  - ${ref}${it.title} (completed: ${last})`;
+    };
+
+    const prompt = [
+      `Write a sprint retrospective for the GitHub project "${title}" (${url}).`,
+      `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
+      `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
+      ``,
+      `Write this as a narrative retrospective — not just bullet points — suitable for sharing with a team lead or stakeholder.`,
+      `Use exactly these six sections in order, with the bold labels shown:`,
+      ``,
+      `**Stage summary** — name the current stage, date range, total items, and the headline completion rate.`,
+      `**What we completed** — narrative of key themes from items completed this stage. Group by component or theme where the titles suggest one. Highlight what shipped, not just a list.`,
+      `**Blockers and concerns** — for each blocker, mention title, assignee, priority, and how long it has been in its current status. Comment on what the blocker pattern suggests.`,
+      `**Untouched items** — stale items that haven't been touched since the stage began. List titles and last-updated dates and note whether they look forgotten.`,
+      `**Done but not staged** — items completed in a previous stage that are still on the board. Flag as housekeeping that should be archived.`,
+      `**Overall health assessment** — a brief RAG status (Red, Amber, or Green) followed by a one-paragraph narrative on overall sprint health, weighing completion rate, blockers, and stale items.`,
+      ``,
+      `Tone: honest, direct, professional. Plain text suitable for Telegram — short paragraphs, no markdown headings beyond the bold section labels above.`,
+      ``,
+      `=== Stage summary data ===`,
+      `Stage: ${stage.label} (number ${stage.number})`,
+      `Date range: ${stage.rangeLabel}`,
+      `Total items on board: ${items.length}`,
+      `Total active items (excluding Won't do / Cancelled / Closed): ${totalActive}`,
+      `Done items: ${doneCount}`,
+      `Headline completion rate (Done / total active): ${completionRate}`,
+      ``,
+      `=== What we completed — Done items updated within ${stage.label} (${completed.length}) ===`,
+      completed.length ? completed.map(formatItem).join('\n') : '(none)',
+      ``,
+      `=== Blockers and concerns (${blockers.length}) ===`,
+      blockers.length ? blockers.map(formatBlocker).join('\n') : '(none)',
+      ``,
+      `=== Untouched items — not Done and not updated since stage start ${new Date(stage.startUtc).toISOString().slice(0,10)} (${untouched.length}) ===`,
+      untouched.length ? untouched.map(formatStale).join('\n') : '(none)',
+      ``,
+      `=== Done but not staged — Done items completed outside ${stage.label} date range (${doneOutsideStage.length}) ===`,
+      doneOutsideStage.length ? doneOutsideStage.map(formatDoneOutside).join('\n') : '(none)',
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 2000,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const reply = response.content.map(b => b.text ?? '').join('').trim();
+
+    insertMessage.run(chatId, 'user', `[Retrospective requested: ${stage.label}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk);
+    }
+  } catch (err) {
+    console.error('Retrospective handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't generate retrospective: ${err.message}`);
   }
 });
 
