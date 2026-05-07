@@ -746,12 +746,35 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
       p => p.updated_at && new Date(p.updated_at).getTime() >= cutoff
     );
 
-    const inProgress = project ? project.items.filter(it => it.status === 'In Progress') : [];
-    const blocked = project ? project.items.filter(isBlocker) : [];
     const stage = getCurrentStage();
+    const updatedInStage = (it) => {
+      if (!it.updatedAt) return false;
+      const t = new Date(it.updatedAt).getTime();
+      return Number.isFinite(t) && t >= stage.startUtc;
+    };
+    const isUntouchedThisStage = (it) => {
+      const status = (it.status || '').toLowerCase();
+      if (status === 'done' || status === "won't do" || status === 'cancelled') return false;
+      if (!it.updatedAt || !it.createdAt) return false;
+      const updT = new Date(it.updatedAt).getTime();
+      const crT = new Date(it.createdAt).getTime();
+      if (!Number.isFinite(updT) || !Number.isFinite(crT)) return false;
+      return updT < stage.startUtc && crT < stage.startUtc;
+    };
+
+    const inProgress = project
+      ? project.items.filter(it => it.status === 'In Progress' && updatedInStage(it))
+      : [];
+    const inReview = project
+      ? project.items.filter(it => it.status === 'In Review' && updatedInStage(it))
+      : [];
+    const blocked = project
+      ? project.items.filter(it => isBlocker(it) && updatedInStage(it))
+      : [];
     const completedThisStage = project
       ? project.items.filter(it => isCompletedInStage(it, stage))
       : [];
+    const untouched = project ? project.items.filter(isUntouchedThisStage) : [];
 
     const formatPR = (p) =>
       `  - ${p.repo}#${p.number}${p.draft ? ' (draft)' : ''} ${p.title}`;
@@ -765,12 +788,20 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
     const prompt = [
       `Write a daily standup update for Patrick that can be pasted directly into Slack or Teams.`,
       `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
+      `IMPORTANT: Only reference project board items active in ${stage.label}. Do not mention historical board items, total board counts, or anything outside this stage's date range.`,
       `Use exactly these four sections, in this order, with the bold labels shown:`,
       `**Yesterday** — derive from PRs updated in the last 24 hours.`,
-      `**Today** — derive from in-progress project board items and open PRs.`,
-      `**Blockers** — list blocked project board items, or write "None" if there are none.`,
+      `**Today** — derive from In Progress and In Review project board items active in ${stage.label}, plus open PRs.`,
+      `**Blockers** — list blocked project board items active in ${stage.label}, or write "None" if there are none.`,
       `**Completed this stage (${stage.label})** — list titles completed in the current stage as a velocity signal, or write "None" if empty. Mention the stage date range once.`,
       `Tight bullets only. No preamble, no sign-off, no emoji, professional tone.`,
+      ``,
+      `Stage-scoped counts (${stage.label}):`,
+      `  Done this stage: ${completedThisStage.length}`,
+      `  In Progress (updated this stage): ${inProgress.length}`,
+      `  In Review (updated this stage): ${inReview.length}`,
+      `  Blockers this stage: ${blocked.length}`,
+      `  Untouched (existed before stage, not updated since): ${untouched.length}`,
       ``,
       `=== PRs updated in the last 24 hours ===`,
       recentPRs.length ? recentPRs.map(formatPR).join('\n') : '(none)',
@@ -778,10 +809,13 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
       `=== All open PRs (context) ===`,
       allOpenPRs.length ? allOpenPRs.map(formatPR).join('\n') : '(none)',
       ``,
-      `=== Project board: In Progress ===`,
+      `=== Project board: In Progress this stage ===`,
       inProgress.length ? inProgress.map(formatItem).join('\n') : '(none)',
       ``,
-      `=== Project board: Blocked ===`,
+      `=== Project board: In Review this stage ===`,
+      inReview.length ? inReview.map(formatItem).join('\n') : '(none)',
+      ``,
+      `=== Project board: Blocked this stage ===`,
       blocked.length ? blocked.map(formatItem).join('\n') : '(none)',
       ``,
       `=== Project board: Completed this stage (${stage.label}, ${stage.rangeLabel}) ===`,
@@ -1386,36 +1420,54 @@ async function sendDailyBriefing() {
       : '(no repos configured)';
 
     const stage = getCurrentStage();
+    const updatedInStage = (it) => {
+      if (!it.updatedAt) return false;
+      const t = new Date(it.updatedAt).getTime();
+      return Number.isFinite(t) && t >= stage.startUtc;
+    };
+    const isUntouchedThisStage = (it) => {
+      const status = (it.status || '').toLowerCase();
+      if (status === 'done' || status === "won't do" || status === 'cancelled') return false;
+      if (!it.updatedAt || !it.createdAt) return false;
+      const updT = new Date(it.updatedAt).getTime();
+      const crT = new Date(it.createdAt).getTime();
+      if (!Number.isFinite(updT) || !Number.isFinite(crT)) return false;
+      return updT < stage.startUtc && crT < stage.startUtc;
+    };
 
     let projectSection = '(project board not configured)';
     if (project && project.items.length) {
-      const byStatus = project.items.reduce((acc, it) => {
-        (acc[it.status] = acc[it.status] || []).push(it);
-        return acc;
-      }, {});
-      const counts = Object.entries(byStatus)
-        .map(([status, list]) => `${status}: ${list.length}`)
-        .join(', ');
       const formatItem = (it) => {
         const ref = it.number ? `#${it.number} ` : '';
         const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
         const pri = it.priority ? ` [priority: ${it.priority}]` : '';
         return `  - ${ref}${it.title}${who}${pri}`;
       };
-      const inProgress = (byStatus['In Progress'] || []).map(formatItem).join('\n') || '  (none)';
-      const blocked = project.items.filter(isBlocker).map(formatItem).join('\n') || '  (none)';
-      const completedThisStage = project.items.filter(it => isCompletedInStage(it, stage));
-      const completed = completedThisStage.length
-        ? completedThisStage.map(formatItem).join('\n')
-        : '  (none)';
+      const renderList = (list) => list.length ? list.map(formatItem).join('\n') : '  (none)';
+
+      const inProgressItems = project.items.filter(it => it.status === 'In Progress' && updatedInStage(it));
+      const inReviewItems = project.items.filter(it => it.status === 'In Review' && updatedInStage(it));
+      const blockedItems = project.items.filter(it => isBlocker(it) && updatedInStage(it));
+      const completedItems = project.items.filter(it => isCompletedInStage(it, stage));
+      const untouchedItems = project.items.filter(isUntouchedThisStage);
+
       projectSection = [
-        `${project.title} — ${project.items.length} items (${counts})`,
-        `In Progress:`,
-        inProgress,
-        `Blocked:`,
-        blocked,
-        `Completed this stage — ${stage.label}, ${stage.rangeLabel} (${completedThisStage.length}):`,
-        completed,
+        `${project.title} — ${stage.label} (${stage.rangeLabel})`,
+        `Stage-scoped counts:`,
+        `  Done this stage: ${completedItems.length}`,
+        `  In Progress (updated this stage): ${inProgressItems.length}`,
+        `  In Review (updated this stage): ${inReviewItems.length}`,
+        `  Blockers this stage: ${blockedItems.length}`,
+        `  Untouched (existed before stage, not updated since): ${untouchedItems.length}`,
+        ``,
+        `In Progress this stage:`,
+        renderList(inProgressItems),
+        `In Review this stage:`,
+        renderList(inReviewItems),
+        `Blocked this stage:`,
+        renderList(blockedItems),
+        `Completed this stage:`,
+        renderList(completedItems),
       ].join('\n');
     } else if (project) {
       projectSection = `${project.title} — no items`;
@@ -1424,10 +1476,11 @@ async function sendDailyBriefing() {
     const prompt = [
       `Write a friendly morning briefing for Patrick. Keep it warm but concise (10-16 short lines).`,
       `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
+      `IMPORTANT: Only reference project board items active in ${stage.label}. Do not mention historical board items, total board counts, or anything outside this stage's date range.`,
       `Cover, in this order:`,
       `1. Greeting`,
       `2. Open PRs across all repos — group by repo, call out anything notable`,
-      `3. Project board status — totals by status, what's in progress, anything blocked that needs attention. An item counts as a blocker only if its priority is "Blocker" and its status is not Done/Won't do/Cancelled/Closed.`,
+      `3. Project board status this stage — use the stage-scoped counts only. Mention what's in progress, what's in review, and anything blocked that needs attention. An item counts as a blocker only if its priority is "Blocker" and its status is not Done/Won't do/Cancelled/Closed.`,
       `4. Velocity for the current stage: report a "Completed this stage (${stage.label})" line with the count and titles, and reference the stage date range once.`,
       `5. End with a small motivational nudge`,
       `No markdown headings. Plain text suitable for Telegram.`,
@@ -1435,7 +1488,7 @@ async function sendDailyBriefing() {
       `Open PRs across ${prsByRepo.length} repo(s), ${totalPRs} total:`,
       prSummary,
       ``,
-      `Project board:`,
+      `Project board (${stage.label} only):`,
       projectSection,
     ].join('\n');
 
