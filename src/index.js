@@ -434,13 +434,18 @@ bot.onText(/^\/metrics(?:@\w+)?(?:\s+([\s\S]+))?$/, async (msg, match) => {
 
   try {
     await bot.sendChatAction(chatId, 'typing');
+    const question =
+      'When counting tickets, bugs, features or issues use the `issues` table. ' +
+      'The issues table has columns: repo, number, title, state, author, created_at, closed_at, labels. ' +
+      'Do not use project_items for issue counts. ' +
+      `Question: ${arg}`;
     const res = await fetch(`${DASHBOARD_URL}/api/chat`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'Accept': 'text/event-stream',
       },
-      body: JSON.stringify({ question: arg }),
+      body: JSON.stringify({ question }),
     });
     if (!res.ok) {
       const errBody = await res.text().catch(() => '');
