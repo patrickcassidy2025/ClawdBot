@@ -685,6 +685,7 @@ function getItemType(item) {
 }
 
 const AREA_FIELD_KEYS = [
+  'be fe', 'fe be', 'be-fe', 'fe-be',
   'be/fe', 'fe/be', 'be / fe', 'fe / be',
   'backend/frontend', 'frontend/backend',
   'stack', 'component', 'area', 'domain', 'tech',
@@ -695,14 +696,14 @@ function getItemArea(item) {
   for (const key of AREA_FIELD_KEYS) {
     if (item.fields && item.fields[key]) { raw = item.fields[key]; break; }
   }
-  if (!raw) return 'No BE FE';
+  if (!raw) return 'No Be Fe';
   const norm = String(raw).trim().toLowerCase().replace(/\s+/g, '');
   if (norm === 'fe' || norm === 'frontend') return 'FE';
   if (norm === 'be' || norm === 'backend') return 'BE';
   if (norm === 'fe/be' || norm === 'be/fe' ||
       norm === 'frontend/backend' || norm === 'backend/frontend' ||
       norm === 'both' || norm === 'fe&be' || norm === 'be&fe') return 'FE/BE';
-  return 'No BE FE';
+  return 'No Be Fe';
 }
 
 bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
@@ -1122,7 +1123,7 @@ bot.onText(/^\/new(?:@\w+)?$/, async (msg) => {
     }
 
     const TYPE_ORDER = ['Bug', 'Feature', 'Story', 'Task', 'No Type'];
-    const AREA_ORDER = ['FE', 'BE', 'FE/BE', 'No BE FE'];
+    const AREA_ORDER = ['FE', 'BE', 'FE/BE', 'No Be Fe'];
 
     const byType = Object.fromEntries(TYPE_ORDER.map(t => [t, []]));
     const areaCounts = Object.fromEntries(AREA_ORDER.map(a => [a, 0]));
