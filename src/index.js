@@ -128,10 +128,10 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/search <query> — web search with sourced summary',
     '/metrics <question> — ask the delivery-intelligence dashboard',
     '/metrics status — check if the dashboard is running',
-    '/project — daily summary of the GitHub project board (append "in MD" for markdown)',
-    '/standup — yesterday/today/blockers standup update (append "in MD" for markdown)',
-    '/retrospective — sprint retrospective for the current stage (append "in MD" for markdown)',
-    '/new — new tickets created during the current stage, grouped by Type and Area (append "in MD" for markdown)',
+    '/project — daily summary of the GitHub project board',
+    '/standup — yesterday/today/blockers standup update',
+    '/retrospective — sprint retrospective for the current stage',
+    '/new — new tickets created during the current stage, grouped by Type and Area',
     '/ask <question> — natural-language Q&A over recent GitHub activity',
     '',
     'You can also send me:',
@@ -712,13 +712,23 @@ function detectMdMode(text) {
   return MD_SUFFIX_REGEX.test(text || '');
 }
 
-function sendOpts(md) {
-  return md ? { parse_mode: 'Markdown' } : {};
+function sendOpts() {
+  return { parse_mode: 'Markdown' };
+}
+
+function extractRepo(url) {
+  if (!url) return null;
+  const m = url.match(/github\.com\/[^/]+\/([^/]+)/);
+  return m ? m[1] : null;
 }
 
 function ticketRef(item) {
   if (!item.number) return '';
-  if (item.url) return `#${item.number} ${item.url}`;
+  if (item.url) {
+    const repo = extractRepo(item.url);
+    const label = repo ? `${repo}#${item.number}` : `#${item.number}`;
+    return `[${label} ↗](${item.url})`;
+  }
   return `#${item.number}`;
 }
 
@@ -730,29 +740,28 @@ function buildUrlMap(items) {
   return map;
 }
 
-function appendUrlsToTicketRefs(text, urlMap) {
+function linkifyTicketRefs(text, urlMap) {
   if (!text || !urlMap.size) return text;
-  return text.replace(/(?<![A-Za-z0-9_])#(\d+)/g, (match, num, offset) => {
+  return text.replace(/(?<![A-Za-z0-9_\[])#(\d+)/g, (match, num, offset) => {
     const url = urlMap.get(Number(num));
     if (!url) return match;
     const after = text.slice(offset + match.length);
-    if (after.startsWith(' ' + url) || after.startsWith('](' + url + ')')) {
-      return match;
-    }
-    return `${match} ${url}`;
+    if (after.startsWith('](')) return match;
+    const repo = extractRepo(url);
+    const label = repo ? `${repo}#${num}` : `#${num}`;
+    return `[${label} ↗](${url})`;
   });
 }
 
-const TICKET_FORMAT_INSTRUCTION = `TICKET FORMATTING: When you reference any ticket, always include BOTH the #NUMBER and its full URL on the same line, in the form "#NUMBER URL" (e.g. "#<number> https://github.com/<org>/<repo>/issues/<number>"). URLs are provided alongside each ticket in the data sections below — copy them verbatim, never invent or shorten. Only reference tickets that appear in the data below. This keeps tickets clickable when the report is pasted into Teams or Slack.`;
+const TICKET_FORMAT_INSTRUCTION = `TICKET FORMATTING: When you reference any ticket, render it as a Telegram-Markdown link with the form "[<repo>#<number> ↗](<url>)" — for example "[<repo>#<number> ↗](https://github.com/<org>/<repo>/issues/<number>)". The data sections below already give each ticket in that exact linked form — copy them verbatim, never invent, shorten, or rewrap. Only reference tickets that appear in the data below.`;
 
-function mdFormattingInstructions(md) {
-  if (!md) return [];
+function mdFormattingInstructions() {
   return [
     ``,
     `FORMATTING (Telegram Markdown, parse_mode 'Markdown'):`,
     `- Use *single asterisks* around section labels for bold. Telegram legacy Markdown does NOT support **double asterisks** — never use them.`,
     `- Use "- " (hyphen space) for bullets. Do not use markdown headings (no #, ##, ###).`,
-    `- Do not wrap ticket references inside markdown links — leave "#NUMBER https://..." as plain text so the URL survives when the report is pasted into Teams.`,
+    `- Every ticket reference must be rendered as the [<repo>#<number> ↗](URL) link form from the data sections. Never leave a bare URL or a bare #NUMBER in the prose.`,
     `- Do not wrap content in code blocks or backticks.`,
   ];
 }
@@ -858,7 +867,7 @@ bot.onText(/^\/project(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       messages: [{ role: 'user', content: prompt }],
     });
     const rawReply = response.content.map(b => b.text ?? '').join('').trim();
-    const reply = appendUrlsToTicketRefs(rawReply, buildUrlMap(items));
+    const reply = linkifyTicketRefs(rawReply, buildUrlMap(items));
 
     insertMessage.run(chatId, 'user', `[Project summary requested: ${org}/#${number}]`, Date.now());
     insertMessage.run(chatId, 'assistant', reply, Date.now());
@@ -923,9 +932,9 @@ bot.onText(/^\/standup(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     const untouched = project ? project.items.filter(isUntouchedThisStage) : [];
 
     const formatPR = (p) => {
-      const refParts = [`${p.repo}#${p.number}`];
-      if (p.url) refParts.push(p.url);
-      const ref = refParts.join(' ');
+      const ref = p.url
+        ? `[${p.repo}#${p.number} ↗](${p.url})`
+        : `${p.repo}#${p.number}`;
       return `  - ${ref}${p.draft ? ' (draft)' : ''} ${p.title}`;
     };
     const formatItem = (it) => {
@@ -936,7 +945,7 @@ bot.onText(/^\/standup(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       return `  - ${ref}${it.title}${who}${pri}`;
     };
 
-    const b = md ? '*' : '**';
+    const b = '*';
     const prompt = [
       `Write a daily standup update for Patrick that can be pasted directly into Slack or Teams.`,
       `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
@@ -987,7 +996,7 @@ bot.onText(/^\/standup(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     for (const p of allOpenPRs) {
       if (p.number && p.url) ticketUrlMap.set(p.number, p.url);
     }
-    const reply = appendUrlsToTicketRefs(rawReply, ticketUrlMap);
+    const reply = linkifyTicketRefs(rawReply, ticketUrlMap);
 
     insertMessage.run(chatId, 'user', '[Standup requested]', Date.now());
     insertMessage.run(chatId, 'assistant', reply, Date.now());
@@ -1100,7 +1109,7 @@ bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     const stageStartLabel = fmtUtcDate(stage.startUtc);
     const stageEndLabel = fmtUtcDate(stage.endUtc - 1);
     const stageHeader = `${stage.label} (${stage.rangeLabel})`;
-    const b = md ? '*' : '**';
+    const b = '*';
     const prompt = [
       `Write a sprint retrospective for the GitHub project "${title}" (${url}).`,
       `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
@@ -1154,7 +1163,7 @@ bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       messages: [{ role: 'user', content: prompt }],
     });
     const rawReply = response.content.map(b => b.text ?? '').join('').trim();
-    const reply = appendUrlsToTicketRefs(rawReply, buildUrlMap(items));
+    const reply = linkifyTicketRefs(rawReply, buildUrlMap(items));
 
     insertMessage.run(chatId, 'user', `[Retrospective requested: ${stage.label}]`, Date.now());
     insertMessage.run(chatId, 'assistant', reply, Date.now());
@@ -1192,7 +1201,7 @@ bot.onText(/^\/new(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       return Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc;
     });
 
-    const b = md ? '*' : '';
+    const b = '*';
     const headerLine = `${b}New tickets — ${stage.label} (${stage.rangeLabel})${b}`;
 
     if (!newItems.length) {
@@ -1674,7 +1683,9 @@ async function sendDailyBriefing() {
           if (!prs.length) return `${repo}: (no open PRs)`;
           const lines = prs
             .map(p => {
-              const ref = md && p.url ? `[${repo}#${p.number}](${p.url})` : `#${p.number}`;
+              const ref = p.url
+                ? `[${repo}#${p.number} ↗](${p.url})`
+                : `${repo}#${p.number}`;
               return `  - ${ref}${p.draft ? ' (draft)' : ''} ${p.title} — @${p.user}`;
             })
             .join('\n');
@@ -1766,7 +1777,7 @@ async function sendDailyBriefing() {
         if (p.number && p.url) ticketUrlMap.set(p.number, p.url);
       }
     }
-    const reply = appendUrlsToTicketRefs(rawReply, ticketUrlMap);
+    const reply = linkifyTicketRefs(rawReply, ticketUrlMap);
 
     await bot.sendMessage(notifyId, reply, sendOpts(md));
   } catch (err) {
