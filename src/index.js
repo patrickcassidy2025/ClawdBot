@@ -128,10 +128,10 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/search <query> — web search with sourced summary',
     '/metrics <question> — ask the delivery-intelligence dashboard',
     '/metrics status — check if the dashboard is running',
-    '/project — daily summary of the Presight-AI GitHub project board',
-    '/standup — generate a yesterday/today/blockers standup update',
-    '/retrospective — sprint retrospective for the current stage',
-    '/new — new tickets created during the current stage, grouped by Type and Area',
+    '/project — daily summary of the GitHub project board (append "in MD" for markdown)',
+    '/standup — yesterday/today/blockers standup update (append "in MD" for markdown)',
+    '/retrospective — sprint retrospective for the current stage (append "in MD" for markdown)',
+    '/new — new tickets created during the current stage, grouped by Type and Area (append "in MD" for markdown)',
     '/ask <question> — natural-language Q&A over recent GitHub activity',
     '',
     'You can also send me:',
@@ -706,9 +706,39 @@ function getItemArea(item) {
   return 'No Be Fe';
 }
 
-bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
+const MD_SUFFIX_REGEX = /\s+in\s+md\s*$/i;
+
+function detectMdMode(text) {
+  return MD_SUFFIX_REGEX.test(text || '');
+}
+
+function sendOpts(md) {
+  return md ? { parse_mode: 'Markdown' } : {};
+}
+
+function ticketRef(item, md) {
+  if (!item.number) return '';
+  if (md && item.url) return `[#${item.number}](${item.url})`;
+  return `#${item.number}`;
+}
+
+function mdFormattingInstructions(md) {
+  if (!md) return [];
+  return [
+    ``,
+    `FORMATTING (Telegram Markdown, parse_mode 'Markdown'):`,
+    `- Use *single asterisks* around section labels for bold. Telegram legacy Markdown does NOT support **double asterisks** — never use them.`,
+    `- Use "- " (hyphen space) for bullets. Do not use markdown headings (no #, ##, ###).`,
+    `- Every ticket reference must be rendered as the clickable link form provided in the data sections, e.g. [#1234](https://github.com/...). Never invent or alter URLs.`,
+    `- For overall health / RAG status, prefix with 🟢 (Green), 🟡 (Amber), or 🔴 (Red).`,
+    `- Do not wrap content in code blocks or backticks.`,
+  ];
+}
+
+bot.onText(/^\/project(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   if (await rateLimited(chatId)) return;
+  const md = !!(match && match[1]);
 
   const org = process.env.GITHUB_PROJECT_ORG;
   const number = Number(process.env.GITHUB_PROJECT_NUMBER);
@@ -743,7 +773,8 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       .join(', ');
 
     const formatItem = (it) => {
-      const ref = it.number ? `#${it.number} ` : '';
+      const r = ticketRef(it, md);
+      const ref = r ? `${r} ` : '';
       const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
       const pri = it.priority ? ` [priority: ${it.priority}]` : '';
       return `  - ${ref}${it.title}${who}${pri}`;
@@ -782,6 +813,7 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       `An item counts as a blocker only if its priority is "Blocker" and its status is not Done/Won't do/Cancelled/Closed. Use the explicit Blockers list below as the source of truth — don't infer additional ones.`,
       `Reference the stage number and date range when discussing completions.`,
       `Keep it readable in Telegram — short paragraphs or grouped bullets, no markdown headings.`,
+      ...mdFormattingInstructions(md),
       ``,
       `Stage-scoped counts by status (iteration membership) (${stage.label}, ${stage.rangeLabel}): ${counts || '(no items in this stage)'}`,
       `Total items tagged to this stage: ${stageItems.length}`,
@@ -808,7 +840,7 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
     insertMessage.run(chatId, 'assistant', reply, Date.now());
 
     for (const chunk of chunkMessage(reply)) {
-      await bot.sendMessage(chatId, chunk);
+      await bot.sendMessage(chatId, chunk, sendOpts(md));
     }
   } catch (err) {
     console.error('Project handler error:', err);
@@ -816,9 +848,10 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
   }
 });
 
-bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
+bot.onText(/^\/standup(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   if (await rateLimited(chatId)) return;
+  const md = !!(match && match[1]);
 
   const org = process.env.GITHUB_PROJECT_ORG;
   const number = Number(process.env.GITHUB_PROJECT_NUMBER);
@@ -865,25 +898,30 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
       : [];
     const untouched = project ? project.items.filter(isUntouchedThisStage) : [];
 
-    const formatPR = (p) =>
-      `  - ${p.repo}#${p.number}${p.draft ? ' (draft)' : ''} ${p.title}`;
+    const formatPR = (p) => {
+      const ref = md && p.url ? `[${p.repo}#${p.number}](${p.url})` : `${p.repo}#${p.number}`;
+      return `  - ${ref}${p.draft ? ' (draft)' : ''} ${p.title}`;
+    };
     const formatItem = (it) => {
-      const ref = it.number ? `#${it.number} ` : '';
+      const r = ticketRef(it, md);
+      const ref = r ? `${r} ` : '';
       const who = it.assignees.length ? ` (@${it.assignees.join(', @')})` : '';
       const pri = it.priority ? ` [priority: ${it.priority}]` : '';
       return `  - ${ref}${it.title}${who}${pri}`;
     };
 
+    const b = md ? '*' : '**';
     const prompt = [
       `Write a daily standup update for Patrick that can be pasted directly into Slack or Teams.`,
       `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
       `IMPORTANT: Only reference project board items active in ${stage.label}. Do not mention historical board items, total board counts, or anything outside this stage's date range.`,
       `Use exactly these four sections, in this order, with the bold labels shown:`,
-      `**Yesterday** — derive from PRs updated in the last 24 hours.`,
-      `**Today** — derive from In Progress and In Review project board items active in ${stage.label}, plus open PRs.`,
-      `**Blockers** — list blocked project board items active in ${stage.label}, or write "None" if there are none.`,
-      `**Completed this stage (${stage.label})** — list titles completed in the current stage as a velocity signal, or write "None" if empty. Mention the stage date range once.`,
+      `${b}Yesterday${b} — derive from PRs updated in the last 24 hours.`,
+      `${b}Today${b} — derive from In Progress and In Review project board items active in ${stage.label}, plus open PRs.`,
+      `${b}Blockers${b} — list blocked project board items active in ${stage.label}, or write "None" if there are none.`,
+      `${b}Completed this stage (${stage.label})${b} — list titles completed in the current stage as a velocity signal, or write "None" if empty. Mention the stage date range once.`,
       `Tight bullets only. No preamble, no sign-off, no emoji, professional tone.`,
+      ...mdFormattingInstructions(md),
       ``,
       `Stage-scoped counts (${stage.label}):`,
       `  Completed this stage (closed during stage window): ${completedThisStage.length}`,
@@ -923,7 +961,7 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
     insertMessage.run(chatId, 'assistant', reply, Date.now());
 
     for (const chunk of chunkMessage(reply)) {
-      await bot.sendMessage(chatId, chunk);
+      await bot.sendMessage(chatId, chunk, sendOpts(md));
     }
   } catch (err) {
     console.error('Standup handler error:', err);
@@ -931,9 +969,10 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
   }
 });
 
-bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
+bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   if (await rateLimited(chatId)) return;
+  const md = !!(match && match[1]);
 
   const org = process.env.GITHUB_PROJECT_ORG;
   const number = Number(process.env.GITHUB_PROJECT_NUMBER);
@@ -997,14 +1036,16 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
       : 'n/a';
 
     const formatItem = (it) => {
-      const ref = it.number ? `#${it.number} ` : '';
+      const r = ticketRef(it, md);
+      const ref = r ? `${r} ` : '';
       const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
       const pri = it.priority ? ` [priority: ${it.priority}]` : '';
       return `  - ${ref}${it.title}${who}${pri}`;
     };
 
     const formatBlocker = (it) => {
-      const ref = it.number ? `#${it.number} ` : '';
+      const r = ticketRef(it, md);
+      const ref = r ? `${r} ` : '';
       const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : ' — (unassigned)';
       const pri = it.priority ? ` [priority: ${it.priority}]` : ' [priority: unset]';
       const d = daysSince(it.updatedAt);
@@ -1013,7 +1054,8 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
     };
 
     const formatStale = (it) => {
-      const ref = it.number ? `#${it.number} ` : '';
+      const r = ticketRef(it, md);
+      const ref = r ? `${r} ` : '';
       const last = it.updatedAt ? new Date(it.updatedAt).toISOString().slice(0, 10) : 'unknown';
       const created = it.createdAt ? new Date(it.createdAt).toISOString().slice(0, 10) : 'unknown';
       const status = it.status || 'No status';
@@ -1026,6 +1068,7 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
     const stageStartLabel = fmtUtcDate(stage.startUtc);
     const stageEndLabel = fmtUtcDate(stage.endUtc - 1);
     const stageHeader = `${stage.label} (${stage.rangeLabel})`;
+    const b = md ? '*' : '**';
     const prompt = [
       `Write a sprint retrospective for the GitHub project "${title}" (${url}).`,
       `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
@@ -1040,14 +1083,15 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
       `Write this as a narrative retrospective — not just bullet points — suitable for sharing with a team lead or stakeholder.`,
       `Use exactly these six sections in order, with the bold labels shown:`,
       ``,
-      `**Stage summary** — name ${stageHeader}, items completed this stage, items active this stage, and the stage completion rate. Do NOT cite total board items or total Done across all stages — use only the stage-scoped numbers provided.`,
-      `**What we completed** — narrative of key themes from items completed during ${stageHeader}. Group by component or theme where the titles suggest one. Highlight what shipped, not just a list.`,
-      `**Blockers and concerns** — for each blocker active in ${stageHeader}, mention title, assignee, priority, and how long it has been in its current status. Comment on what the blocker pattern suggests.`,
-      `**Untouched items** — stale items that existed before ${stageStartLabel} and haven't been touched since the stage began. List titles and dates and note whether they look forgotten.`,
-      `**Velocity trend** — for ${stageHeader}, note items completed this stage and the stage completion rate. Brief comment on what the rate suggests, no historical speculation and no all-time totals.`,
-      `**Overall health assessment** — a brief RAG status (Red, Amber, or Green) followed by a one-paragraph narrative on overall sprint health, weighing completion rate, blockers, and stale items.`,
+      `${b}Stage summary${b} — name ${stageHeader}, items completed this stage, items active this stage, and the stage completion rate. Do NOT cite total board items or total Done across all stages — use only the stage-scoped numbers provided.`,
+      `${b}What we completed${b} — narrative of key themes from items completed during ${stageHeader}. Group by component or theme where the titles suggest one. Highlight what shipped, not just a list.`,
+      `${b}Blockers and concerns${b} — for each blocker active in ${stageHeader}, mention title, assignee, priority, and how long it has been in its current status. Comment on what the blocker pattern suggests.`,
+      `${b}Untouched items${b} — stale items that existed before ${stageStartLabel} and haven't been touched since the stage began. List titles and dates and note whether they look forgotten.`,
+      `${b}Velocity trend${b} — for ${stageHeader}, note items completed this stage and the stage completion rate. Brief comment on what the rate suggests, no historical speculation and no all-time totals.`,
+      `${b}Overall health assessment${b} — a brief RAG status (Red, Amber, or Green) followed by a one-paragraph narrative on overall sprint health, weighing completion rate, blockers, and stale items.`,
       ``,
       `Tone: honest, direct, professional. Plain text suitable for Telegram — short paragraphs, no markdown headings beyond the bold section labels above.`,
+      ...mdFormattingInstructions(md),
       ``,
       `=== Stage summary (${stageHeader}) ===`,
       `Stage: ${stage.label} (number ${stage.number})`,
@@ -1083,7 +1127,7 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
     insertMessage.run(chatId, 'assistant', reply, Date.now());
 
     for (const chunk of chunkMessage(reply)) {
-      await bot.sendMessage(chatId, chunk);
+      await bot.sendMessage(chatId, chunk, sendOpts(md));
     }
   } catch (err) {
     console.error('Retrospective handler error:', err);
@@ -1091,9 +1135,10 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
   }
 });
 
-bot.onText(/^\/new(?:@\w+)?$/, async (msg) => {
+bot.onText(/^\/new(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   if (await rateLimited(chatId)) return;
+  const md = !!(match && match[1]);
 
   const org = process.env.GITHUB_PROJECT_ORG;
   const number = Number(process.env.GITHUB_PROJECT_NUMBER);
@@ -1114,11 +1159,14 @@ bot.onText(/^\/new(?:@\w+)?$/, async (msg) => {
       return Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc;
     });
 
+    const b = md ? '*' : '';
+    const headerLine = `${b}New tickets — ${stage.label} (${stage.rangeLabel})${b}`;
+
     if (!newItems.length) {
-      const empty = `New tickets — ${stage.label} (${stage.rangeLabel})\nTotal: 0`;
+      const empty = `${headerLine}\nTotal: 0`;
       insertMessage.run(chatId, 'user', `[New tickets requested: ${stage.label}]`, Date.now());
       insertMessage.run(chatId, 'assistant', empty, Date.now());
-      await bot.sendMessage(chatId, empty);
+      await bot.sendMessage(chatId, empty, sendOpts(md));
       return;
     }
 
@@ -1135,22 +1183,23 @@ bot.onText(/^\/new(?:@\w+)?$/, async (msg) => {
     }
 
     const formatItem = ({ item, area }) => {
-      const ref = item.number ? `#${item.number} ` : '';
+      const r = ticketRef(item, md);
+      const ref = r ? `${r} ` : '';
       const who = item.assignees.length ? ` — @${item.assignees.join(', @')}` : '';
       return `  - [${area}] ${ref}${item.title}${who}`;
     };
 
     const lines = [
-      `New tickets — ${stage.label} (${stage.rangeLabel})`,
+      headerLine,
       `Total: ${newItems.length}`,
       ``,
-      'By Type: ' + TYPE_ORDER.map(t => `${t} ${byType[t].length}`).join(' · '),
-      'By Area: ' + AREA_ORDER.map(a => `${a} ${areaCounts[a]}`).join(' · '),
+      `${b}By Type${b}: ` + TYPE_ORDER.map(t => `${t} ${byType[t].length}`).join(' · '),
+      `${b}By Area${b}: ` + AREA_ORDER.map(a => `${a} ${areaCounts[a]}`).join(' · '),
       ``,
     ];
     for (const t of TYPE_ORDER) {
       if (!byType[t].length) continue;
-      lines.push(`${t} (${byType[t].length}):`);
+      lines.push(`${b}${t} (${byType[t].length})${b}:`);
       for (const entry of byType[t]) lines.push(formatItem(entry));
       lines.push('');
     }
@@ -1160,7 +1209,7 @@ bot.onText(/^\/new(?:@\w+)?$/, async (msg) => {
     insertMessage.run(chatId, 'assistant', reply, Date.now());
 
     for (const chunk of chunkMessage(reply)) {
-      await bot.sendMessage(chatId, chunk);
+      await bot.sendMessage(chatId, chunk, sendOpts(md));
     }
   } catch (err) {
     console.error('New tickets handler error:', err);
@@ -1577,6 +1626,7 @@ async function fetchProjectForBriefing() {
 async function sendDailyBriefing() {
   const notifyId = process.env.TELEGRAM_NOTIFY_CHAT_ID;
   if (!notifyId) return;
+  const md = process.env.BRIEFING_MD === '1';
 
   try {
     const [prsByRepo, project] = await Promise.all([
@@ -1590,7 +1640,10 @@ async function sendDailyBriefing() {
           if (error) return `${repo}: (error fetching PRs: ${error})`;
           if (!prs.length) return `${repo}: (no open PRs)`;
           const lines = prs
-            .map(p => `  - #${p.number}${p.draft ? ' (draft)' : ''} ${p.title} — @${p.user}`)
+            .map(p => {
+              const ref = md && p.url ? `[${repo}#${p.number}](${p.url})` : `#${p.number}`;
+              return `  - ${ref}${p.draft ? ' (draft)' : ''} ${p.title} — @${p.user}`;
+            })
             .join('\n');
           return `${repo}:\n${lines}`;
         }).join('\n\n')
@@ -1610,7 +1663,8 @@ async function sendDailyBriefing() {
     let projectSection = '(project board not configured)';
     if (project && project.items.length) {
       const formatItem = (it) => {
-        const ref = it.number ? `#${it.number} ` : '';
+        const r = ticketRef(it, md);
+        const ref = r ? `${r} ` : '';
         const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
         const pri = it.priority ? ` [priority: ${it.priority}]` : '';
         return `  - ${ref}${it.title}${who}${pri}`;
@@ -1656,6 +1710,7 @@ async function sendDailyBriefing() {
       `4. Velocity for the current stage: report a "Completed this stage (${stage.label})" line with the count and titles, and reference the stage date range once.`,
       `5. End with a small motivational nudge`,
       `No markdown headings. Plain text suitable for Telegram.`,
+      ...mdFormattingInstructions(md),
       ``,
       `Open PRs across ${prsByRepo.length} repo(s), ${totalPRs} total:`,
       prSummary,
@@ -1671,7 +1726,7 @@ async function sendDailyBriefing() {
       messages: [{ role: 'user', content: prompt }],
     });
 
-    await bot.sendMessage(notifyId, response.content[0].text);
+    await bot.sendMessage(notifyId, response.content[0].text, sendOpts(md));
   } catch (err) {
     console.error('Daily briefing failed:', err);
   }
