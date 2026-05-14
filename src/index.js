@@ -131,6 +131,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/project — daily summary of the Presight-AI GitHub project board',
     '/standup — generate a yesterday/today/blockers standup update',
     '/retrospective — sprint retrospective for the current stage',
+    '/new — new tickets created during the current stage, grouped by Type and Area',
     '/ask <question> — natural-language Q&A over recent GitHub activity',
     '',
     'You can also send me:',
@@ -488,6 +489,7 @@ const PROJECT_ITEMS_QUERY = `
               __typename
               ... on Issue {
                 title number url state closedAt
+                issueType { name }
                 assignees(first: 10) { nodes { login } }
               }
               ... on PullRequest {
@@ -571,6 +573,18 @@ async function fetchProjectItems(org, number) {
       const iterationNode = node.fieldValues.nodes.find(
         v => v.__typename === 'ProjectV2ItemFieldIterationValue' && v.title
       );
+      const fields = {};
+      for (const v of node.fieldValues.nodes) {
+        const name = v.field?.name;
+        if (!name) continue;
+        const value = v.__typename === 'ProjectV2ItemFieldSingleSelectValue'
+          ? v.name
+          : v.__typename === 'ProjectV2ItemFieldTextValue'
+            ? v.text
+            : null;
+        if (value == null) continue;
+        fields[name.toLowerCase()] = value;
+      }
       items.push({
         title: content.title,
         type: content.__typename,
@@ -584,6 +598,8 @@ async function fetchProjectItems(org, number) {
         createdAt: node.createdAt ?? null,
         iterationTitle: iterationNode?.title ?? null,
         closedAt: content.closedAt ?? null,
+        issueType: content.issueType?.name ?? null,
+        fields,
       });
     }
     if (!project.items.pageInfo.hasNextPage) break;
@@ -651,6 +667,42 @@ function wasCompletedThisStage(item, stage) {
     return Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc;
   }
   return isInCurrentStage(item, stage);
+}
+
+const TYPE_BUCKETS = ['Bug', 'Feature', 'Story', 'Task'];
+const TYPE_FIELD_KEYS = ['type', 'issue type', 'kind'];
+
+function getItemType(item) {
+  let raw = null;
+  for (const key of TYPE_FIELD_KEYS) {
+    if (item.fields && item.fields[key]) { raw = item.fields[key]; break; }
+  }
+  if (!raw) raw = item.issueType;
+  if (!raw) return 'No Type';
+  const norm = String(raw).trim().toLowerCase();
+  const match = TYPE_BUCKETS.find(b => b.toLowerCase() === norm);
+  return match ?? 'No Type';
+}
+
+const AREA_FIELD_KEYS = [
+  'be/fe', 'fe/be', 'be / fe', 'fe / be',
+  'backend/frontend', 'frontend/backend',
+  'stack', 'component', 'area', 'domain', 'tech',
+];
+
+function getItemArea(item) {
+  let raw = null;
+  for (const key of AREA_FIELD_KEYS) {
+    if (item.fields && item.fields[key]) { raw = item.fields[key]; break; }
+  }
+  if (!raw) return 'No BE FE';
+  const norm = String(raw).trim().toLowerCase().replace(/\s+/g, '');
+  if (norm === 'fe' || norm === 'frontend') return 'FE';
+  if (norm === 'be' || norm === 'backend') return 'BE';
+  if (norm === 'fe/be' || norm === 'be/fe' ||
+      norm === 'frontend/backend' || norm === 'backend/frontend' ||
+      norm === 'both' || norm === 'fe&be' || norm === 'be&fe') return 'FE/BE';
+  return 'No BE FE';
 }
 
 bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
@@ -1035,6 +1087,83 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
   } catch (err) {
     console.error('Retrospective handler error:', err);
     await bot.sendMessage(chatId, `Couldn't generate retrospective: ${err.message}`);
+  }
+});
+
+bot.onText(/^\/new(?:@\w+)?$/, async (msg) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+
+  const org = process.env.GITHUB_PROJECT_ORG;
+  const number = Number(process.env.GITHUB_PROJECT_NUMBER);
+  if (!org || !Number.isInteger(number)) {
+    await bot.sendMessage(chatId, 'Project board not configured: set GITHUB_PROJECT_ORG and GITHUB_PROJECT_NUMBER.');
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+    const { items } = await fetchProjectItems(org, number);
+    const stage = getCurrentStage();
+
+    const newItems = items.filter(it => {
+      if ((it.status || '').toLowerCase() === "won't do") return false;
+      if (!it.createdAt) return false;
+      const t = new Date(it.createdAt).getTime();
+      return Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc;
+    });
+
+    if (!newItems.length) {
+      const empty = `New tickets — ${stage.label} (${stage.rangeLabel})\nTotal: 0`;
+      insertMessage.run(chatId, 'user', `[New tickets requested: ${stage.label}]`, Date.now());
+      insertMessage.run(chatId, 'assistant', empty, Date.now());
+      await bot.sendMessage(chatId, empty);
+      return;
+    }
+
+    const TYPE_ORDER = ['Bug', 'Feature', 'Story', 'Task', 'No Type'];
+    const AREA_ORDER = ['FE', 'BE', 'FE/BE', 'No BE FE'];
+
+    const byType = Object.fromEntries(TYPE_ORDER.map(t => [t, []]));
+    const areaCounts = Object.fromEntries(AREA_ORDER.map(a => [a, 0]));
+    for (const it of newItems) {
+      const tBucket = getItemType(it);
+      const aBucket = getItemArea(it);
+      byType[tBucket].push({ item: it, area: aBucket });
+      areaCounts[aBucket] += 1;
+    }
+
+    const formatItem = ({ item, area }) => {
+      const ref = item.number ? `#${item.number} ` : '';
+      const who = item.assignees.length ? ` — @${item.assignees.join(', @')}` : '';
+      return `  - [${area}] ${ref}${item.title}${who}`;
+    };
+
+    const lines = [
+      `New tickets — ${stage.label} (${stage.rangeLabel})`,
+      `Total: ${newItems.length}`,
+      ``,
+      'By Type: ' + TYPE_ORDER.map(t => `${t} ${byType[t].length}`).join(' · '),
+      'By Area: ' + AREA_ORDER.map(a => `${a} ${areaCounts[a]}`).join(' · '),
+      ``,
+    ];
+    for (const t of TYPE_ORDER) {
+      if (!byType[t].length) continue;
+      lines.push(`${t} (${byType[t].length}):`);
+      for (const entry of byType[t]) lines.push(formatItem(entry));
+      lines.push('');
+    }
+
+    const reply = lines.join('\n').trimEnd();
+    insertMessage.run(chatId, 'user', `[New tickets requested: ${stage.label}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk);
+    }
+  } catch (err) {
+    console.error('New tickets handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't fetch new tickets: ${err.message}`);
   }
 });
 
