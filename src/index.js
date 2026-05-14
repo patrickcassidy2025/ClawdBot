@@ -641,13 +641,16 @@ function isInCurrentStage(item, stage) {
       return true;
     }
   }
-  if ((item.status || '').toLowerCase() === 'done' && item.closedAt) {
-    const closedT = new Date(item.closedAt).getTime();
-    if (Number.isFinite(closedT) && closedT >= stage.startUtc && closedT < stage.endUtc) {
-      return true;
-    }
-  }
   return false;
+}
+
+function wasCompletedThisStage(item, stage) {
+  if ((item.status || '').toLowerCase() !== 'done') return false;
+  if (item.closedAt) {
+    const t = new Date(item.closedAt).getTime();
+    return Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc;
+  }
+  return isInCurrentStage(item, stage);
 }
 
 bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
@@ -704,7 +707,11 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       ? blockers.map(formatItem).join('\n')
       : '(none)';
 
-    const completedThisStage = stageItems.filter(it => it.status === 'Done');
+    const completedThisStage = items.filter(it => {
+      const status = (it.status || '').toLowerCase();
+      if (status === "won't do") return false;
+      return wasCompletedThisStage(it, stage);
+    });
     const completedSection = completedThisStage.length
       ? completedThisStage.map(formatItem).join('\n')
       : '(none)';
@@ -714,21 +721,25 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
       `Write a concise daily summary for the GitHub project "${title}" (${url}).`,
       `IMPORTANT SCOPE: Every number, count, and item below is scoped to ${stage.label} only. Do not mention or invent any historical totals, all-time Done counts, or items from previous stages. If a value isn't in the data below, do not report it.`,
-      `Cover: items by status for this stage, what's in progress (with owners), any blocked items that need attention, and a "Completed this stage (${stage.label})" callout that reports the count and titles as a velocity signal.`,
+      `There are TWO distinct numbers — use them precisely and do not conflate:`,
+      `  • "By status" counts (Done, In Progress, etc.) are iteration membership — items tagged to ${stage.label}.`,
+      `  • "Completed this stage" is the velocity signal — items closed during the stage window (may include items originally tagged to earlier stages but closed in this window).`,
+      `So Done in the byStatus breakdown will usually be SMALLER than Completed this stage, and that is correct.`,
+      `Cover: items by status for this stage, what's in progress (with owners), any blocked items that need attention, and a separate "Completed this stage (${stage.label})" callout that reports its own count and titles as a velocity signal.`,
       `An item counts as a blocker only if its priority is "Blocker" and its status is not Done/Won't do/Cancelled/Closed. Use the explicit Blockers list below as the source of truth — don't infer additional ones.`,
       `Reference the stage number and date range when discussing completions.`,
       `Keep it readable in Telegram — short paragraphs or grouped bullets, no markdown headings.`,
       ``,
-      `Stage-scoped counts (${stage.label}, ${stage.rangeLabel}): ${counts || '(no items in this stage)'}`,
-      `Total items in this stage: ${stageItems.length}`,
+      `Stage-scoped counts by status (iteration membership) (${stage.label}, ${stage.rangeLabel}): ${counts || '(no items in this stage)'}`,
+      `Total items tagged to this stage: ${stageItems.length}`,
       ``,
       `Blockers this stage (${blockers.length}):`,
       blockersSection,
       ``,
-      `Completed this stage — ${stage.label}, ${stage.rangeLabel} (${completedThisStage.length}):`,
+      `Completed this stage — closed during ${stage.label}, ${stage.rangeLabel} (${completedThisStage.length}):`,
       completedSection,
       ``,
-      `Items in this stage grouped by status:`,
+      `Items tagged to this stage grouped by status:`,
       detail || '(none)',
     ].join('\n');
 
@@ -797,7 +808,7 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
       ? project.items.filter(it => isBlocker(it) && isInCurrentStage(it, stage))
       : [];
     const completedThisStage = project
-      ? project.items.filter(it => it.status === 'Done' && isInCurrentStage(it, stage))
+      ? project.items.filter(it => wasCompletedThisStage(it, stage))
       : [];
     const untouched = project ? project.items.filter(isUntouchedThisStage) : [];
 
@@ -822,9 +833,9 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
       `Tight bullets only. No preamble, no sign-off, no emoji, professional tone.`,
       ``,
       `Stage-scoped counts (${stage.label}):`,
-      `  Done this stage: ${completedThisStage.length}`,
-      `  In Progress (updated this stage): ${inProgress.length}`,
-      `  In Review (updated this stage): ${inReview.length}`,
+      `  Completed this stage (closed during stage window): ${completedThisStage.length}`,
+      `  In Progress (tagged to this iteration): ${inProgress.length}`,
+      `  In Review (tagged to this iteration): ${inReview.length}`,
       `  Blockers this stage: ${blocked.length}`,
       `  Untouched (existed before stage, not updated since): ${untouched.length}`,
       ``,
@@ -897,7 +908,7 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
       return Math.floor((now - t) / DAY_MS);
     };
 
-    const completed = items.filter(it => it.status === 'Done' && isInCurrentStage(it, stage));
+    const completed = items.filter(it => wasCompletedThisStage(it, stage));
     const blockers = items.filter(isBlocker);
 
     const untouched = items.filter(it => {
@@ -931,7 +942,6 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
     const stageCompletionRate = stageTotal > 0
       ? `${Math.round((completed.length / stageTotal) * 100)}% (${completed.length}/${stageTotal})`
       : 'n/a';
-    const doneCount = items.filter(it => (it.status || '').toLowerCase() === 'done').length;
 
     const formatItem = (it) => {
       const ref = it.number ? `#${it.number} ` : '';
@@ -981,7 +991,7 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
       `**What we completed** — narrative of key themes from items completed during ${stageHeader}. Group by component or theme where the titles suggest one. Highlight what shipped, not just a list.`,
       `**Blockers and concerns** — for each blocker active in ${stageHeader}, mention title, assignee, priority, and how long it has been in its current status. Comment on what the blocker pattern suggests.`,
       `**Untouched items** — stale items that existed before ${stageStartLabel} and haven't been touched since the stage began. List titles and dates and note whether they look forgotten.`,
-      `**Velocity trend** — for ${stageHeader}, note items completed this stage and the simple ratio of total items on the board vs total Done overall. Brief comment on what the ratio suggests, no historical speculation.`,
+      `**Velocity trend** — for ${stageHeader}, note items completed this stage and the stage completion rate. Brief comment on what the rate suggests, no historical speculation and no all-time totals.`,
       `**Overall health assessment** — a brief RAG status (Red, Amber, or Green) followed by a one-paragraph narrative on overall sprint health, weighing completion rate, blockers, and stale items.`,
       ``,
       `Tone: honest, direct, professional. Plain text suitable for Telegram — short paragraphs, no markdown headings beyond the bold section labels above.`,
@@ -1004,8 +1014,8 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
       ``,
       `=== ${stage.label} velocity (${stage.rangeLabel}) ===`,
       `Items completed in ${stage.label}: ${completed.length}`,
-      `Total items on board (all stages): ${items.length}`,
-      `Total Done items overall: ${doneCount}`,
+      `Items active in ${stage.label}: ${activeThisStage}`,
+      `Stage completion rate: ${stageCompletionRate}`,
     ].join('\n');
 
     const response = await anthropic.messages.create({
@@ -1480,15 +1490,15 @@ async function sendDailyBriefing() {
       const inProgressItems = project.items.filter(it => it.status === 'In Progress' && isInCurrentStage(it, stage));
       const inReviewItems = project.items.filter(it => it.status === 'In Review' && isInCurrentStage(it, stage));
       const blockedItems = project.items.filter(it => isBlocker(it) && isInCurrentStage(it, stage));
-      const completedItems = project.items.filter(it => it.status === 'Done' && isInCurrentStage(it, stage));
+      const completedItems = project.items.filter(it => wasCompletedThisStage(it, stage));
       const untouchedItems = project.items.filter(isUntouchedThisStage);
 
       projectSection = [
         `${project.title} — ${stage.label} (${stage.rangeLabel})`,
         `Stage-scoped counts:`,
-        `  Done this stage: ${completedItems.length}`,
-        `  In Progress (updated this stage): ${inProgressItems.length}`,
-        `  In Review (updated this stage): ${inReviewItems.length}`,
+        `  Completed this stage (closed during stage window): ${completedItems.length}`,
+        `  In Progress (tagged to this iteration): ${inProgressItems.length}`,
+        `  In Review (tagged to this iteration): ${inReviewItems.length}`,
         `  Blockers this stage: ${blockedItems.length}`,
         `  Untouched (existed before stage, not updated since): ${untouchedItems.length}`,
         ``,
