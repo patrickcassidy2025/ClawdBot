@@ -487,11 +487,11 @@ const PROJECT_ITEMS_QUERY = `
             content {
               __typename
               ... on Issue {
-                title number url state
+                title number url state closedAt
                 assignees(first: 10) { nodes { login } }
               }
               ... on PullRequest {
-                title number url state
+                title number url state closedAt
                 assignees(first: 10) { nodes { login } }
               }
               ... on DraftIssue {
@@ -508,6 +508,10 @@ const PROJECT_ITEMS_QUERY = `
                 }
                 ... on ProjectV2ItemFieldTextValue {
                   text
+                  field { ... on ProjectV2FieldCommon { name } }
+                }
+                ... on ProjectV2ItemFieldIterationValue {
+                  title
                   field { ... on ProjectV2FieldCommon { name } }
                 }
               }
@@ -564,6 +568,9 @@ async function fetchProjectItems(org, number) {
             v.__typename === 'ProjectV2ItemFieldTextValue')
       );
       const priority = priorityNode?.name ?? priorityNode?.text ?? null;
+      const iterationNode = node.fieldValues.nodes.find(
+        v => v.__typename === 'ProjectV2ItemFieldIterationValue' && v.title
+      );
       items.push({
         title: content.title,
         type: content.__typename,
@@ -575,6 +582,8 @@ async function fetchProjectItems(org, number) {
         priority,
         updatedAt: node.updatedAt ?? null,
         createdAt: node.createdAt ?? null,
+        iterationTitle: iterationNode?.title ?? null,
+        closedAt: content.closedAt ?? null,
       });
     }
     if (!project.items.pageInfo.hasNextPage) break;
@@ -620,11 +629,25 @@ function getCurrentStage(now = new Date()) {
   };
 }
 
-function isCompletedInStage(item, stage) {
-  if ((item.status || '').toLowerCase() !== 'done') return false;
-  if (!item.updatedAt) return false;
-  const t = new Date(item.updatedAt).getTime();
-  return Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc;
+function isInCurrentStage(item, stage) {
+  if (item.iterationTitle) {
+    const match = item.iterationTitle.match(/(\d+)/);
+    if (!match) return false;
+    return parseInt(match[1], 10) === stage.number;
+  }
+  if (item.createdAt) {
+    const ct = new Date(item.createdAt).getTime();
+    if (Number.isFinite(ct) && ct >= stage.startUtc && ct < stage.endUtc) {
+      return true;
+    }
+  }
+  if ((item.status || '').toLowerCase() === 'done' && item.closedAt) {
+    const closedT = new Date(item.closedAt).getTime();
+    if (Number.isFinite(closedT) && closedT >= stage.startUtc && closedT < stage.endUtc) {
+      return true;
+    }
+  }
+  return false;
 }
 
 bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
@@ -675,7 +698,7 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       : '(none)';
 
     const stage = getCurrentStage();
-    const completedThisStage = items.filter(it => isCompletedInStage(it, stage));
+    const completedThisStage = items.filter(it => it.status === 'Done' && isInCurrentStage(it, stage));
     const completedSection = completedThisStage.length
       ? completedThisStage.map(formatItem).join('\n')
       : '(none)';
@@ -747,11 +770,6 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
     );
 
     const stage = getCurrentStage();
-    const updatedInStage = (it) => {
-      if (!it.updatedAt) return false;
-      const t = new Date(it.updatedAt).getTime();
-      return Number.isFinite(t) && t >= stage.startUtc;
-    };
     const isUntouchedThisStage = (it) => {
       const status = (it.status || '').toLowerCase();
       if (status === 'done' || status === "won't do" || status === 'cancelled') return false;
@@ -763,16 +781,16 @@ bot.onText(/^\/standup(?:@\w+)?$/, async (msg) => {
     };
 
     const inProgress = project
-      ? project.items.filter(it => it.status === 'In Progress' && updatedInStage(it))
+      ? project.items.filter(it => it.status === 'In Progress' && isInCurrentStage(it, stage))
       : [];
     const inReview = project
-      ? project.items.filter(it => it.status === 'In Review' && updatedInStage(it))
+      ? project.items.filter(it => it.status === 'In Review' && isInCurrentStage(it, stage))
       : [];
     const blocked = project
-      ? project.items.filter(it => isBlocker(it) && updatedInStage(it))
+      ? project.items.filter(it => isBlocker(it) && isInCurrentStage(it, stage))
       : [];
     const completedThisStage = project
-      ? project.items.filter(it => isCompletedInStage(it, stage))
+      ? project.items.filter(it => it.status === 'Done' && isInCurrentStage(it, stage))
       : [];
     const untouched = project ? project.items.filter(isUntouchedThisStage) : [];
 
@@ -872,7 +890,7 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
       return Math.floor((now - t) / DAY_MS);
     };
 
-    const completed = items.filter(it => isCompletedInStage(it, stage));
+    const completed = items.filter(it => it.status === 'Done' && isInCurrentStage(it, stage));
     const blockers = items.filter(isBlocker);
 
     const untouched = items.filter(it => {
@@ -892,14 +910,9 @@ bot.onText(/^\/retrospective(?:@\w+)?$/, async (msg) => {
     const completedDisplay = completed.slice(0, 30);
     const blockersDisplay = blockers.slice(0, 30);
 
-    const updatedInStage = (it) => {
-      if (!it.updatedAt) return false;
-      const t = new Date(it.updatedAt).getTime();
-      return Number.isFinite(t) && t >= stage.startUtc;
-    };
-    const inProgressThisStage = items.filter(it => it.status === 'In Progress' && updatedInStage(it));
-    const inReviewThisStage = items.filter(it => it.status === 'In Review' && updatedInStage(it));
-    const blockersThisStage = items.filter(it => isBlocker(it) && updatedInStage(it));
+    const inProgressThisStage = items.filter(it => it.status === 'In Progress' && isInCurrentStage(it, stage));
+    const inReviewThisStage = items.filter(it => it.status === 'In Review' && isInCurrentStage(it, stage));
+    const blockersThisStage = items.filter(it => isBlocker(it) && isInCurrentStage(it, stage));
     const activeSet = new Set([
       ...inProgressThisStage,
       ...inReviewThisStage,
@@ -1437,11 +1450,6 @@ async function sendDailyBriefing() {
       : '(no repos configured)';
 
     const stage = getCurrentStage();
-    const updatedInStage = (it) => {
-      if (!it.updatedAt) return false;
-      const t = new Date(it.updatedAt).getTime();
-      return Number.isFinite(t) && t >= stage.startUtc;
-    };
     const isUntouchedThisStage = (it) => {
       const status = (it.status || '').toLowerCase();
       if (status === 'done' || status === "won't do" || status === 'cancelled') return false;
@@ -1462,10 +1470,10 @@ async function sendDailyBriefing() {
       };
       const renderList = (list) => list.length ? list.map(formatItem).join('\n') : '  (none)';
 
-      const inProgressItems = project.items.filter(it => it.status === 'In Progress' && updatedInStage(it));
-      const inReviewItems = project.items.filter(it => it.status === 'In Review' && updatedInStage(it));
-      const blockedItems = project.items.filter(it => isBlocker(it) && updatedInStage(it));
-      const completedItems = project.items.filter(it => isCompletedInStage(it, stage));
+      const inProgressItems = project.items.filter(it => it.status === 'In Progress' && isInCurrentStage(it, stage));
+      const inReviewItems = project.items.filter(it => it.status === 'In Review' && isInCurrentStage(it, stage));
+      const blockedItems = project.items.filter(it => isBlocker(it) && isInCurrentStage(it, stage));
+      const completedItems = project.items.filter(it => it.status === 'Done' && isInCurrentStage(it, stage));
       const untouchedItems = project.items.filter(isUntouchedThisStage);
 
       projectSection = [
