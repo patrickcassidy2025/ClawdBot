@@ -670,7 +670,14 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       return;
     }
 
-    const byStatus = items.reduce((acc, it) => {
+    const stage = getCurrentStage();
+    const stageItems = items.filter(it => {
+      const status = (it.status || '').toLowerCase();
+      if (status === "won't do") return false;
+      return isInCurrentStage(it, stage);
+    });
+
+    const byStatus = stageItems.reduce((acc, it) => {
       (acc[it.status] = acc[it.status] || []).push(it);
       return acc;
     }, {});
@@ -692,13 +699,12 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
         return `${status} (${list.length}):\n${lines}`;
       }).join('\n\n');
 
-    const blockers = items.filter(isBlocker);
+    const blockers = stageItems.filter(isBlocker);
     const blockersSection = blockers.length
       ? blockers.map(formatItem).join('\n')
       : '(none)';
 
-    const stage = getCurrentStage();
-    const completedThisStage = items.filter(it => it.status === 'Done' && isInCurrentStage(it, stage));
+    const completedThisStage = stageItems.filter(it => it.status === 'Done');
     const completedSection = completedThisStage.length
       ? completedThisStage.map(formatItem).join('\n')
       : '(none)';
@@ -707,22 +713,23 @@ bot.onText(/^\/project(?:@\w+)?$/, async (msg) => {
       `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
       `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
       `Write a concise daily summary for the GitHub project "${title}" (${url}).`,
-      `Cover: total items by status, what's in progress (with owners), any blocked items that need attention, and a "Completed this stage (${stage.label})" callout that reports the count and titles as a velocity signal.`,
+      `IMPORTANT SCOPE: Every number, count, and item below is scoped to ${stage.label} only. Do not mention or invent any historical totals, all-time Done counts, or items from previous stages. If a value isn't in the data below, do not report it.`,
+      `Cover: items by status for this stage, what's in progress (with owners), any blocked items that need attention, and a "Completed this stage (${stage.label})" callout that reports the count and titles as a velocity signal.`,
       `An item counts as a blocker only if its priority is "Blocker" and its status is not Done/Won't do/Cancelled/Closed. Use the explicit Blockers list below as the source of truth — don't infer additional ones.`,
       `Reference the stage number and date range when discussing completions.`,
       `Keep it readable in Telegram — short paragraphs or grouped bullets, no markdown headings.`,
       ``,
-      `Counts: ${counts}`,
-      `Total items: ${items.length}`,
+      `Stage-scoped counts (${stage.label}, ${stage.rangeLabel}): ${counts || '(no items in this stage)'}`,
+      `Total items in this stage: ${stageItems.length}`,
       ``,
-      `Blockers (${blockers.length}):`,
+      `Blockers this stage (${blockers.length}):`,
       blockersSection,
       ``,
       `Completed this stage — ${stage.label}, ${stage.rangeLabel} (${completedThisStage.length}):`,
       completedSection,
       ``,
-      `Items grouped by status:`,
-      detail,
+      `Items in this stage grouped by status:`,
+      detail || '(none)',
     ].join('\n');
 
     const response = await anthropic.messages.create({
