@@ -716,11 +716,34 @@ function sendOpts(md) {
   return md ? { parse_mode: 'Markdown' } : {};
 }
 
-function ticketRef(item, md) {
+function ticketRef(item) {
   if (!item.number) return '';
-  if (md && item.url) return `[#${item.number}](${item.url})`;
+  if (item.url) return `#${item.number} ${item.url}`;
   return `#${item.number}`;
 }
+
+function buildUrlMap(items) {
+  const map = new Map();
+  for (const it of items) {
+    if (it.number && it.url) map.set(it.number, it.url);
+  }
+  return map;
+}
+
+function appendUrlsToTicketRefs(text, urlMap) {
+  if (!text || !urlMap.size) return text;
+  return text.replace(/(?<![A-Za-z0-9_])#(\d+)/g, (match, num, offset) => {
+    const url = urlMap.get(Number(num));
+    if (!url) return match;
+    const after = text.slice(offset + match.length);
+    if (after.startsWith(' ' + url) || after.startsWith('](' + url + ')')) {
+      return match;
+    }
+    return `${match} ${url}`;
+  });
+}
+
+const TICKET_FORMAT_INSTRUCTION = `TICKET FORMATTING: When you reference any ticket, always include BOTH the #NUMBER and its full URL on the same line, in the form "#NUMBER URL" (e.g. "#<number> https://github.com/<org>/<repo>/issues/<number>"). URLs are provided alongside each ticket in the data sections below — copy them verbatim, never invent or shorten. Only reference tickets that appear in the data below. This keeps tickets clickable when the report is pasted into Teams or Slack.`;
 
 function mdFormattingInstructions(md) {
   if (!md) return [];
@@ -729,8 +752,7 @@ function mdFormattingInstructions(md) {
     `FORMATTING (Telegram Markdown, parse_mode 'Markdown'):`,
     `- Use *single asterisks* around section labels for bold. Telegram legacy Markdown does NOT support **double asterisks** — never use them.`,
     `- Use "- " (hyphen space) for bullets. Do not use markdown headings (no #, ##, ###).`,
-    `- Every ticket reference must be rendered as the clickable link form provided in the data sections, e.g. [#1234](https://github.com/...). Never invent or alter URLs.`,
-    `- For overall health / RAG status, prefix with 🟢 (Green), 🟡 (Amber), or 🔴 (Red).`,
+    `- Do not wrap ticket references inside markdown links — leave "#NUMBER https://..." as plain text so the URL survives when the report is pasted into Teams.`,
     `- Do not wrap content in code blocks or backticks.`,
   ];
 }
@@ -773,7 +795,7 @@ bot.onText(/^\/project(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       .join(', ');
 
     const formatItem = (it) => {
-      const r = ticketRef(it, md);
+      const r = ticketRef(it);
       const ref = r ? `${r} ` : '';
       const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
       const pri = it.priority ? ` [priority: ${it.priority}]` : '';
@@ -813,6 +835,7 @@ bot.onText(/^\/project(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       `An item counts as a blocker only if its priority is "Blocker" and its status is not Done/Won't do/Cancelled/Closed. Use the explicit Blockers list below as the source of truth — don't infer additional ones.`,
       `Reference the stage number and date range when discussing completions.`,
       `Keep it readable in Telegram — short paragraphs or grouped bullets, no markdown headings.`,
+      TICKET_FORMAT_INSTRUCTION,
       ...mdFormattingInstructions(md),
       ``,
       `Stage-scoped counts by status (iteration membership) (${stage.label}, ${stage.rangeLabel}): ${counts || '(no items in this stage)'}`,
@@ -834,7 +857,8 @@ bot.onText(/^\/project(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       system: systemPrompt,
       messages: [{ role: 'user', content: prompt }],
     });
-    const reply = response.content.map(b => b.text ?? '').join('').trim();
+    const rawReply = response.content.map(b => b.text ?? '').join('').trim();
+    const reply = appendUrlsToTicketRefs(rawReply, buildUrlMap(items));
 
     insertMessage.run(chatId, 'user', `[Project summary requested: ${org}/#${number}]`, Date.now());
     insertMessage.run(chatId, 'assistant', reply, Date.now());
@@ -899,11 +923,13 @@ bot.onText(/^\/standup(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     const untouched = project ? project.items.filter(isUntouchedThisStage) : [];
 
     const formatPR = (p) => {
-      const ref = md && p.url ? `[${p.repo}#${p.number}](${p.url})` : `${p.repo}#${p.number}`;
+      const refParts = [`${p.repo}#${p.number}`];
+      if (p.url) refParts.push(p.url);
+      const ref = refParts.join(' ');
       return `  - ${ref}${p.draft ? ' (draft)' : ''} ${p.title}`;
     };
     const formatItem = (it) => {
-      const r = ticketRef(it, md);
+      const r = ticketRef(it);
       const ref = r ? `${r} ` : '';
       const who = it.assignees.length ? ` (@${it.assignees.join(', @')})` : '';
       const pri = it.priority ? ` [priority: ${it.priority}]` : '';
@@ -921,6 +947,7 @@ bot.onText(/^\/standup(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       `${b}Blockers${b} — list blocked project board items active in ${stage.label}, or write "None" if there are none.`,
       `${b}Completed this stage (${stage.label})${b} — list titles completed in the current stage as a velocity signal, or write "None" if empty. Mention the stage date range once.`,
       `Tight bullets only. No preamble, no sign-off, no emoji, professional tone.`,
+      TICKET_FORMAT_INSTRUCTION,
       ...mdFormattingInstructions(md),
       ``,
       `Stage-scoped counts (${stage.label}):`,
@@ -955,7 +982,12 @@ bot.onText(/^\/standup(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       system: systemPrompt,
       messages: [{ role: 'user', content: prompt }],
     });
-    const reply = response.content.map(b => b.text ?? '').join('').trim();
+    const rawReply = response.content.map(b => b.text ?? '').join('').trim();
+    const ticketUrlMap = project ? buildUrlMap(project.items) : new Map();
+    for (const p of allOpenPRs) {
+      if (p.number && p.url) ticketUrlMap.set(p.number, p.url);
+    }
+    const reply = appendUrlsToTicketRefs(rawReply, ticketUrlMap);
 
     insertMessage.run(chatId, 'user', '[Standup requested]', Date.now());
     insertMessage.run(chatId, 'assistant', reply, Date.now());
@@ -1036,7 +1068,7 @@ bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       : 'n/a';
 
     const formatItem = (it) => {
-      const r = ticketRef(it, md);
+      const r = ticketRef(it);
       const ref = r ? `${r} ` : '';
       const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
       const pri = it.priority ? ` [priority: ${it.priority}]` : '';
@@ -1044,7 +1076,7 @@ bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     };
 
     const formatBlocker = (it) => {
-      const r = ticketRef(it, md);
+      const r = ticketRef(it);
       const ref = r ? `${r} ` : '';
       const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : ' — (unassigned)';
       const pri = it.priority ? ` [priority: ${it.priority}]` : ' [priority: unset]';
@@ -1054,7 +1086,7 @@ bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     };
 
     const formatStale = (it) => {
-      const r = ticketRef(it, md);
+      const r = ticketRef(it);
       const ref = r ? `${r} ` : '';
       const last = it.updatedAt ? new Date(it.updatedAt).toISOString().slice(0, 10) : 'unknown';
       const created = it.createdAt ? new Date(it.createdAt).toISOString().slice(0, 10) : 'unknown';
@@ -1081,16 +1113,16 @@ bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       `Use the exact stage window dates supplied in each section heading below — do not infer or guess dates.`,
       ``,
       `Write this as a narrative retrospective — not just bullet points — suitable for sharing with a team lead or stakeholder.`,
-      `Use exactly these six sections in order, with the bold labels shown:`,
+      `Use exactly these five sections in order, with the bold labels shown:`,
       ``,
       `${b}Stage summary${b} — name ${stageHeader}, items completed this stage, items active this stage, and the stage completion rate. Do NOT cite total board items or total Done across all stages — use only the stage-scoped numbers provided.`,
       `${b}What we completed${b} — narrative of key themes from items completed during ${stageHeader}. Group by component or theme where the titles suggest one. Highlight what shipped, not just a list.`,
       `${b}Blockers and concerns${b} — for each blocker active in ${stageHeader}, mention title, assignee, priority, and how long it has been in its current status. Comment on what the blocker pattern suggests.`,
       `${b}Untouched items${b} — stale items that existed before ${stageStartLabel} and haven't been touched since the stage began. List titles and dates and note whether they look forgotten.`,
       `${b}Velocity trend${b} — for ${stageHeader}, note items completed this stage and the stage completion rate. Brief comment on what the rate suggests, no historical speculation and no all-time totals.`,
-      `${b}Overall health assessment${b} — a brief RAG status (Red, Amber, or Green) followed by a one-paragraph narrative on overall sprint health, weighing completion rate, blockers, and stale items.`,
       ``,
       `Tone: honest, direct, professional. Plain text suitable for Telegram — short paragraphs, no markdown headings beyond the bold section labels above.`,
+      TICKET_FORMAT_INSTRUCTION,
       ...mdFormattingInstructions(md),
       ``,
       `=== Stage summary (${stageHeader}) ===`,
@@ -1121,7 +1153,8 @@ bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       system: systemPrompt,
       messages: [{ role: 'user', content: prompt }],
     });
-    const reply = response.content.map(b => b.text ?? '').join('').trim();
+    const rawReply = response.content.map(b => b.text ?? '').join('').trim();
+    const reply = appendUrlsToTicketRefs(rawReply, buildUrlMap(items));
 
     insertMessage.run(chatId, 'user', `[Retrospective requested: ${stage.label}]`, Date.now());
     insertMessage.run(chatId, 'assistant', reply, Date.now());
@@ -1183,7 +1216,7 @@ bot.onText(/^\/new(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     }
 
     const formatItem = ({ item, area }) => {
-      const r = ticketRef(item, md);
+      const r = ticketRef(item);
       const ref = r ? `${r} ` : '';
       const who = item.assignees.length ? ` — @${item.assignees.join(', @')}` : '';
       return `  - [${area}] ${ref}${item.title}${who}`;
@@ -1663,7 +1696,7 @@ async function sendDailyBriefing() {
     let projectSection = '(project board not configured)';
     if (project && project.items.length) {
       const formatItem = (it) => {
-        const r = ticketRef(it, md);
+        const r = ticketRef(it);
         const ref = r ? `${r} ` : '';
         const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
         const pri = it.priority ? ` [priority: ${it.priority}]` : '';
@@ -1710,6 +1743,7 @@ async function sendDailyBriefing() {
       `4. Velocity for the current stage: report a "Completed this stage (${stage.label})" line with the count and titles, and reference the stage date range once.`,
       `5. End with a small motivational nudge`,
       `No markdown headings. Plain text suitable for Telegram.`,
+      TICKET_FORMAT_INSTRUCTION,
       ...mdFormattingInstructions(md),
       ``,
       `Open PRs across ${prsByRepo.length} repo(s), ${totalPRs} total:`,
@@ -1725,8 +1759,16 @@ async function sendDailyBriefing() {
       system: systemPrompt,
       messages: [{ role: 'user', content: prompt }],
     });
+    const rawReply = response.content[0].text;
+    const ticketUrlMap = project ? buildUrlMap(project.items) : new Map();
+    for (const { prs } of prsByRepo) {
+      for (const p of prs) {
+        if (p.number && p.url) ticketUrlMap.set(p.number, p.url);
+      }
+    }
+    const reply = appendUrlsToTicketRefs(rawReply, ticketUrlMap);
 
-    await bot.sendMessage(notifyId, response.content[0].text, sendOpts(md));
+    await bot.sendMessage(notifyId, reply, sendOpts(md));
   } catch (err) {
     console.error('Daily briefing failed:', err);
   }
