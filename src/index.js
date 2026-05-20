@@ -713,7 +713,7 @@ function detectMdMode(text) {
 }
 
 function sendOpts() {
-  return { parse_mode: 'Markdown' };
+  return {};
 }
 
 function extractRepo(url) {
@@ -727,7 +727,7 @@ function ticketRef(item) {
   if (item.url) {
     const repo = extractRepo(item.url);
     const label = repo ? `${repo}#${item.number}` : `#${item.number}`;
-    return `[${label} ↗](${item.url})`;
+    return `${label} (${item.url})`;
   }
   return `#${item.number}`;
 }
@@ -742,27 +742,26 @@ function buildUrlMap(items) {
 
 function linkifyTicketRefs(text, urlMap) {
   if (!text || !urlMap.size) return text;
-  return text.replace(/(?<![A-Za-z0-9_\[])#(\d+)/g, (match, num, offset) => {
+  return text.replace(/(?<![A-Za-z0-9_(])#(\d+)/g, (match, num, offset) => {
     const url = urlMap.get(Number(num));
     if (!url) return match;
     const after = text.slice(offset + match.length);
-    if (after.startsWith('](')) return match;
+    if (after.startsWith(' (http') || after.startsWith('(http')) return match;
     const repo = extractRepo(url);
     const label = repo ? `${repo}#${num}` : `#${num}`;
-    return `[${label} ↗](${url})`;
+    return `${label} (${url})`;
   });
 }
 
-const TICKET_FORMAT_INSTRUCTION = `TICKET FORMATTING: When you reference any ticket, render it as a Telegram-Markdown link with the form "[<repo>#<number> ↗](<url>)" — for example "[<repo>#<number> ↗](https://github.com/<org>/<repo>/issues/<number>)". The data sections below already give each ticket in that exact linked form — copy them verbatim, never invent, shorten, or rewrap. Only reference tickets that appear in the data below.`;
+const TICKET_FORMAT_INSTRUCTION = `TICKET FORMATTING: When you reference any ticket, render it as plain text in the form "<repo>#<number> (<url>)" — for example "<repo>#<number> (https://github.com/<org>/<repo>/issues/<number>)". The data sections below already give each ticket in that exact form — copy them verbatim, never invent, shorten, or rewrap. Only reference tickets that appear in the data below.`;
 
 function mdFormattingInstructions() {
   return [
     ``,
-    `FORMATTING (Telegram Markdown, parse_mode 'Markdown'):`,
-    `- Use *single asterisks* around section labels for bold. Telegram legacy Markdown does NOT support **double asterisks** — never use them.`,
-    `- Use "- " (hyphen space) for bullets. Do not use markdown headings (no #, ##, ###).`,
-    `- Every ticket reference must be rendered as the [<repo>#<number> ↗](URL) link form from the data sections. Never leave a bare URL or a bare #NUMBER in the prose.`,
-    `- Do not wrap content in code blocks or backticks.`,
+    `FORMATTING (plain text — the message is sent without any parse_mode, so markdown syntax will display literally and break readability):`,
+    `- Do NOT use markdown syntax: no *asterisks*, no _underscores_, no \`backticks\`, no [text](url) link syntax, no #/##/### headings.`,
+    `- Use "- " (hyphen space) for bullets, and "Label:" or ALL CAPS for section labels.`,
+    `- Every ticket reference must appear verbatim as "<repo>#<number> (<url>)" from the data sections. Never leave a bare #NUMBER in the prose. Telegram will auto-linkify the URL.`,
   ];
 }
 
@@ -945,12 +944,12 @@ bot.onText(/^\/standup(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       return `  - ${ref}${it.title}${who}${pri}`;
     };
 
-    const b = '*';
+    const b = '';
     const prompt = [
       `Write a daily standup update for Patrick that can be pasted directly into Slack or Teams.`,
       `Current sprint: ${stage.label} (${stage.rangeLabel}).`,
       `IMPORTANT: Only reference project board items active in ${stage.label}. Do not mention historical board items, total board counts, or anything outside this stage's date range.`,
-      `Use exactly these four sections, in this order, with the bold labels shown:`,
+      `Use exactly these four sections, in this order, with the labels shown (write labels as plain text followed by a colon):`,
       `${b}Yesterday${b} — derive from PRs updated in the last 24 hours.`,
       `${b}Today${b} — derive from In Progress and In Review project board items active in ${stage.label}, plus open PRs.`,
       `${b}Blockers${b} — list blocked project board items active in ${stage.label}, or write "None" if there are none.`,
@@ -1109,7 +1108,7 @@ bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     const stageStartLabel = fmtUtcDate(stage.startUtc);
     const stageEndLabel = fmtUtcDate(stage.endUtc - 1);
     const stageHeader = `${stage.label} (${stage.rangeLabel})`;
-    const b = '*';
+    const b = '';
     const prompt = [
       `Write a sprint retrospective for the GitHub project "${title}" (${url}).`,
       `Today's date is ${new Date().toLocaleDateString('en-GB', {day: 'numeric', month: 'long', year: 'numeric'})}.`,
@@ -1122,7 +1121,7 @@ bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       `Use the exact stage window dates supplied in each section heading below — do not infer or guess dates.`,
       ``,
       `Write this as a narrative retrospective — not just bullet points — suitable for sharing with a team lead or stakeholder.`,
-      `Use exactly these five sections in order, with the bold labels shown:`,
+      `Use exactly these five sections in order, with the labels shown (write labels as plain text followed by a colon):`,
       ``,
       `${b}Stage summary${b} — name ${stageHeader}, items completed this stage, items active this stage, and the stage completion rate. Do NOT cite total board items or total Done across all stages — use only the stage-scoped numbers provided.`,
       `${b}What we completed${b} — narrative of key themes from items completed during ${stageHeader}. Group by component or theme where the titles suggest one. Highlight what shipped, not just a list.`,
@@ -1130,7 +1129,7 @@ bot.onText(/^\/retrospective(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       `${b}Untouched items${b} — stale items that existed before ${stageStartLabel} and haven't been touched since the stage began. List titles and dates and note whether they look forgotten.`,
       `${b}Velocity trend${b} — for ${stageHeader}, note items completed this stage and the stage completion rate. Brief comment on what the rate suggests, no historical speculation and no all-time totals.`,
       ``,
-      `Tone: honest, direct, professional. Plain text suitable for Telegram — short paragraphs, no markdown headings beyond the bold section labels above.`,
+      `Tone: honest, direct, professional. Plain text suitable for Telegram — short paragraphs, no markdown of any kind.`,
       TICKET_FORMAT_INSTRUCTION,
       ...mdFormattingInstructions(md),
       ``,
@@ -1201,7 +1200,7 @@ bot.onText(/^\/new(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       return Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc;
     });
 
-    const b = '*';
+    const b = '';
     const headerLine = `${b}New tickets — ${stage.label} (${stage.rangeLabel})${b}`;
 
     if (!newItems.length) {
