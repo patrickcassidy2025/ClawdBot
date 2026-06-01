@@ -623,26 +623,69 @@ function isBlocker(item) {
   return priority === 'blocker';
 }
 
-const STAGE_LENGTH_MS = 14 * 24 * 60 * 60 * 1000;
-const STAGE_REFERENCE_NUMBER = 8;
-const STAGE_REFERENCE_START_UTC = Date.UTC(2026, 3, 26);
+// Corrected stage calendar. Stages are explicit (non-uniform length):
+// Stage 09 is 3 weeks; every other stage is 2 weeks, continuing 2-weekly
+// from Stage 10 onwards.
+const STAGES = [
+  { number: 8,  start: '2026-04-26', end: '2026-05-09' },
+  { number: 9,  start: '2026-05-10', end: '2026-05-31' },
+  { number: 10, start: '2026-06-01', end: '2026-06-14' },
+  { number: 11, start: '2026-06-15', end: '2026-06-28' },
+  { number: 12, start: '2026-06-29', end: '2026-07-12' },
+  { number: 13, start: '2026-07-13', end: '2026-07-26' },
+  { number: 14, start: '2026-07-27', end: '2026-08-09' },
+  { number: 15, start: '2026-08-10', end: '2026-08-23' },
+  { number: 16, start: '2026-08-24', end: '2026-09-06' },
+];
 
-function getCurrentStage(now = new Date()) {
-  const offset = now.getTime() - STAGE_REFERENCE_START_UTC;
-  const stagesElapsed = Math.floor(offset / STAGE_LENGTH_MS);
-  const number = STAGE_REFERENCE_NUMBER + stagesElapsed;
-  const startUtc = STAGE_REFERENCE_START_UTC + stagesElapsed * STAGE_LENGTH_MS;
-  const endUtc = startUtc + STAGE_LENGTH_MS;
-  const fmt = (ms) => new Date(ms).toLocaleDateString('en-GB', {
+// Start of day (00:00:00.000 UTC) for a 'YYYY-MM-DD' string.
+function stageStartUtc(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return Date.UTC(y, m - 1, d);
+}
+
+// End of day (23:59:59.999 UTC) for a 'YYYY-MM-DD' string, so that the full
+// final day is included by downstream `< stage.endUtc` comparisons.
+function stageEndUtc(dateStr) {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return Date.UTC(y, m - 1, d, 23, 59, 59, 999);
+}
+
+function fmtStageDate(ms) {
+  return new Date(ms).toLocaleDateString('en-GB', {
     day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
   });
+}
+
+function buildStage(s) {
+  const startUtc = stageStartUtc(s.start);
+  const endUtc = stageEndUtc(s.end);
+  const startLabel = fmtStageDate(startUtc);
+  const endLabel = fmtStageDate(endUtc);
   return {
-    number,
-    label: `Stage ${String(number).padStart(2, '0')}`,
+    number: s.number,
+    label: `Stage ${String(s.number).padStart(2, '0')}`,
     startUtc,
     endUtc,
-    rangeLabel: `${fmt(startUtc)} – ${fmt(endUtc - 1)}`,
+    startLabel,
+    endLabel,
+    rangeLabel: `${startLabel} – ${endLabel}`,
   };
+}
+
+function getCurrentStage(now = new Date()) {
+  const t = now.getTime();
+
+  // 1. Stage whose [start, end] window (inclusive) contains `now`.
+  const current = STAGES.find(s => t >= stageStartUtc(s.start) && t <= stageEndUtc(s.end));
+  if (current) return buildStage(current);
+
+  // 2. Outside all defined stages: return the most recently completed stage.
+  const completed = STAGES.filter(s => stageEndUtc(s.end) < t);
+  if (completed.length) return buildStage(completed[completed.length - 1]);
+
+  // Before the calendar begins — fall back to the first defined stage.
+  return buildStage(STAGES[0]);
 }
 
 function isInCurrentStage(item, stage) {
