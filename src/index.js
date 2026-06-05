@@ -1368,19 +1368,6 @@ bot.onText(/^\/yesterday(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       .filter(t => t !== 'Story' || typeCounts['Story'] > 0)
       .map(t => `${t}: ${typeCounts[t]}`).join(', ');
 
-    const assigneeCount = new Map();
-    for (const it of closedThisStage) {
-      if (!it.assignees.length) {
-        assigneeCount.set('(unassigned)', (assigneeCount.get('(unassigned)') || 0) + 1);
-        continue;
-      }
-      for (const a of it.assignees) assigneeCount.set(a, (assigneeCount.get(a) || 0) + 1);
-    }
-    const topAssignees = [...assigneeCount.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 5)
-      .map(([a, c]) => `${a === '(unassigned)' ? '(unassigned)' : '@' + a}: ${c}`);
-
     // Closed-ticket data passed for theme analysis only — not to be listed.
     const closedThemeData = closedThisStage.slice(0, 60)
       .map(it => `- ${esc(it.title)} [${getItemType(it)}]`);
@@ -1404,16 +1391,14 @@ bot.onText(/^\/yesterday(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     const section3Lines = createdYesterday.slice(0, SECTION_CAP).map(it =>
       `${num(it)} — ${esc(it.title)} (${who(it)}) [${it.priority || 'No priority'}] [${it.status || 'No status'}]`);
 
-    // Summary line counts — daily pulse (yesterday-scoped) plus current In Progress total.
+    // Summary line counts — daily pulse (yesterday-scoped) plus In Progress untouched this stage.
     const touchedCount = items.filter(it => !isExcluded(it) && inYesterday(it.updatedAt)).length;
     const closedYesterdayCount = items.filter(it =>
       !isExcluded(it) && (it.status || '').toLowerCase() === 'done' && inYesterday(it.updatedAt)).length;
-    const inProgressTotal = items.filter(it =>
-      !isExcluded(it) && (it.status || '').toLowerCase() === 'in progress').length;
     const blockersRaised = items.filter(it =>
       !isExcluded(it) && isBlockerPriority(it) && (inYesterday(it.updatedAt) || inYesterday(it.createdAt))).length;
 
-    const summaryLine = `${yLabel} — Touched: ${touchedCount} | Created: ${createdYesterday.length} | Closed: ${closedYesterdayCount} | In Progress: ${inProgressTotal} | Blockers raised: ${blockersRaised}`;
+    const summaryLine = `${yLabel} — Touched: ${touchedCount} | Created: ${createdYesterday.length} | Closed: ${closedYesterdayCount} | Blockers raised: ${blockersRaised} | In Progress untouched this stage: ${inProgressStaleStage.length}`;
 
     const prompt = [
       `Generate a compact, factual daily activity report for the GitHub project "${title}".`,
@@ -1433,7 +1418,6 @@ bot.onText(/^\/yesterday(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       `=== SECTION 1 — print the header "Closed this stage" then, each on its own line: ===`,
       `Total closed this stage: ${closedThisStage.length}`,
       `By type: ${typeLine}`,
-      `Top assignees: ${topAssignees.length ? topAssignees.join(', ') : 'None'}`,
       `Then add ONE or TWO sentences of factual insight (dominant themes, concentration of work, notable patterns — e.g. "8 of 12 closed were bugs") drawn ONLY from the closed-ticket data below. Do NOT list the tickets individually.`,
       `Closed-ticket data for theme analysis only (do NOT reproduce as a list):`,
       closedThisStage.length ? closedThemeData.join('\n') : '(none closed this stage)',
