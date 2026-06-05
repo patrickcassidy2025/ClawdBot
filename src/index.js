@@ -1357,16 +1357,16 @@ bot.onText(/^\/yesterday(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     // Section 1: Closed this stage (uses the shared completed-in-stage logic).
     const closedThisStage = items.filter(it => !isExcluded(it) && wasCompletedThisStage(it, stage));
 
-    const PRIORITY_BUCKETS = ['Blocker', 'High', 'Medium', 'Low'];
-    const priorityCounts = Object.fromEntries(PRIORITY_BUCKETS.map(p => [p, 0]));
-    let priorityUnset = 0;
+    const TYPE_ORDER = ['Bug', 'Feature', 'Task', 'Story', 'No Type'];
+    const typeCounts = Object.fromEntries(TYPE_ORDER.map(t => [t, 0]));
     for (const it of closedThisStage) {
-      const p = (it.priority || '').toLowerCase();
-      const bucket = PRIORITY_BUCKETS.find(b => b.toLowerCase() === p);
-      if (bucket) priorityCounts[bucket] += 1; else priorityUnset += 1;
+      const t = getItemType(it);
+      typeCounts[t] = (typeCounts[t] || 0) + 1;
     }
-    const priorityLine = PRIORITY_BUCKETS.map(b => `${b}: ${priorityCounts[b]}`).join(', ')
-      + (priorityUnset ? `, Unset: ${priorityUnset}` : '');
+    // Show Story only when present, so the line reads Bug/Feature/Task/No Type otherwise.
+    const typeLine = TYPE_ORDER
+      .filter(t => t !== 'Story' || typeCounts['Story'] > 0)
+      .map(t => `${t}: ${typeCounts[t]}`).join(', ');
 
     const assigneeCount = new Map();
     for (const it of closedThisStage) {
@@ -1383,7 +1383,7 @@ bot.onText(/^\/yesterday(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
 
     // Closed-ticket data passed for theme analysis only — not to be listed.
     const closedThemeData = closedThisStage.slice(0, 60)
-      .map(it => `- ${esc(it.title)} [${it.priority || 'No priority'}]`);
+      .map(it => `- ${esc(it.title)} [${getItemType(it)}]`);
 
     // Section 2: In Progress with no activity this stage (updatedAt before stage start).
     const SECTION_CAP = 30;
@@ -1432,9 +1432,9 @@ bot.onText(/^\/yesterday(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       ``,
       `=== SECTION 1 — print the header "Closed this stage" then, each on its own line: ===`,
       `Total closed this stage: ${closedThisStage.length}`,
-      `By priority: ${priorityLine}`,
+      `By type: ${typeLine}`,
       `Top assignees: ${topAssignees.length ? topAssignees.join(', ') : 'None'}`,
-      `Then add ONE or TWO sentences of factual insight (dominant themes, concentration of work, notable patterns) drawn ONLY from the closed-ticket data below. Do NOT list the tickets individually.`,
+      `Then add ONE or TWO sentences of factual insight (dominant themes, concentration of work, notable patterns — e.g. "8 of 12 closed were bugs") drawn ONLY from the closed-ticket data below. Do NOT list the tickets individually.`,
       `Closed-ticket data for theme analysis only (do NOT reproduce as a list):`,
       closedThisStage.length ? closedThemeData.join('\n') : '(none closed this stage)',
       ``,
