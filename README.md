@@ -30,6 +30,24 @@ It runs on an Ubuntu VPS, connects to Telegram, and uses Claude as the initial m
 6. Enable the systemd service
 7. Test Telegram messaging
 
+## Bot commands
+
+- `/help` — show the list of available commands
+- `/clear` — reset your conversation history
+- `/status` — show uptime and memory usage
+- `/review <github-pr-url>` — review a GitHub pull request
+- `/search <query>` — web search with a sourced summary
+- `/metrics <question>` — ask the delivery-intelligence dashboard
+- `/metrics status` — check if the dashboard is running
+- `/project` — daily summary of the GitHub project board
+- `/yesterday` — summary of project board activity from the previous calendar day (UTC), covering items created and updated yesterday, grouped by status, with completions highlighted
+- `/standup` — yesterday/today/blockers standup update
+- `/retrospective` — sprint retrospective for the current stage
+- `/new` — new tickets created during the current stage, grouped by Type and Area
+- `/ask <question>` — natural-language Q&A over recent GitHub activity
+
+Project-board commands (`/project`, `/yesterday`, `/standup`, `/retrospective`, `/new`) accept an `in MD` suffix to return markdown-formatted output. You can also send PDFs (summarised), photos (described), and voice messages (transcribed).
+
 ## Security rules
 
 - Never commit `.env`

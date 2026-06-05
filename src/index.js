@@ -129,6 +129,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/metrics <question> — ask the delivery-intelligence dashboard',
     '/metrics status — check if the dashboard is running',
     '/project — daily summary of the GitHub project board',
+    '/yesterday — summary of project board activity from yesterday (UTC)',
     '/standup — yesterday/today/blockers standup update',
     '/retrospective — sprint retrospective for the current stage',
     '/new — new tickets created during the current stage, grouped by Type and Area',
@@ -1298,6 +1299,153 @@ bot.onText(/^\/new(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
   } catch (err) {
     console.error('New tickets handler error:', err);
     await bot.sendMessage(chatId, `Couldn't fetch new tickets: ${err.message}`);
+  }
+});
+
+bot.onText(/^\/yesterday(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+  const md = !!(match && match[1]);
+
+  const org = process.env.GITHUB_PROJECT_ORG;
+  const number = Number(process.env.GITHUB_PROJECT_NUMBER);
+  if (!org || !Number.isInteger(number)) {
+    await bot.sendMessage(chatId, 'Project board not configured: set GITHUB_PROJECT_ORG and GITHUB_PROJECT_NUMBER.');
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+    const { items, title, url } = await fetchProjectItems(org, number);
+
+    if (!items.length) {
+      await bot.sendMessage(chatId, `Project "${title}" has no items.`);
+      return;
+    }
+
+    const now = new Date();
+    const yesterdayStart = new Date(Date.UTC(
+      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 0, 0, 0));
+    const yesterdayEnd = new Date(Date.UTC(
+      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 23, 59, 59));
+    const ys = yesterdayStart.getTime();
+    const ye = yesterdayEnd.getTime();
+    const yLabel = yesterdayStart.toLocaleDateString('en-GB', {
+      day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
+    });
+
+    const inYesterday = (iso) => {
+      if (!iso) return false;
+      const t = new Date(iso).getTime();
+      return Number.isFinite(t) && t >= ys && t <= ye;
+    };
+    const beforeYesterday = (iso) => {
+      if (!iso) return false;
+      const t = new Date(iso).getTime();
+      return Number.isFinite(t) && t < ys;
+    };
+
+    const isExcluded = (it) => {
+      const status = (it.status || '').toLowerCase();
+      return status === "won't do" || status === 'cancelled';
+    };
+
+    const newItems = items.filter(it => !isExcluded(it) && inYesterday(it.createdAt));
+    const touchedItems = items.filter(it =>
+      !isExcluded(it) && inYesterday(it.updatedAt) && beforeYesterday(it.createdAt));
+    const doneYesterday = items.filter(it => {
+      if (isExcluded(it)) return false;
+      if ((it.status || '').toLowerCase() !== 'done') return false;
+      return inYesterday(it.closedAt) || inYesterday(it.updatedAt);
+    });
+
+    if (!newItems.length && !touchedItems.length) {
+      const empty = `Activity Summary for ${yLabel}\nNo project board activity yesterday.`;
+      insertMessage.run(chatId, 'user', `[Yesterday activity requested: ${yLabel}]`, Date.now());
+      insertMessage.run(chatId, 'assistant', empty, Date.now());
+      await bot.sendMessage(chatId, empty, sendOpts(md));
+      return;
+    }
+
+    // Cap total items sent to Claude at 100 to avoid token limits.
+    const MAX_ITEMS = 100;
+    let cappedNew = newItems;
+    let cappedTouched = touchedItems;
+    if (newItems.length + touchedItems.length > MAX_ITEMS) {
+      cappedNew = newItems.slice(0, MAX_ITEMS);
+      cappedTouched = touchedItems.slice(0, Math.max(0, MAX_ITEMS - cappedNew.length));
+    }
+
+    const formatItem = (it) => {
+      const r = ticketRef(it);
+      const ref = r ? `${r} ` : '';
+      const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
+      const pri = it.priority ? ` [priority: ${it.priority}]` : '';
+      const status = it.status || 'No status';
+      return `  - ${ref}${it.title} (status: ${status})${who}${pri}`;
+    };
+
+    const byStatus = cappedTouched.reduce((acc, it) => {
+      const key = it.status || 'No status';
+      (acc[key] = acc[key] || []).push(it);
+      return acc;
+    }, {});
+    const statusCounts = Object.entries(byStatus)
+      .map(([status, list]) => `${status}: ${list.length}`)
+      .join(', ');
+    const touchedDetail = Object.entries(byStatus)
+      .map(([status, list]) =>
+        `${status} (${list.length}):\n${list.map(formatItem).join('\n')}`)
+      .join('\n\n');
+
+    const prompt = [
+      `Write a concise daily activity summary for the GitHub project "${title}" (${url}).`,
+      `Begin with the exact header line: "Activity Summary for ${yLabel}".`,
+      `This report covers project board activity for ${yLabel} only (00:00:00–23:59:59 UTC).`,
+      `Keep it factual and brief, not narrative — suitable for a quick morning catch-up: who created what and who updated what yesterday.`,
+      `Cover, in this order, using only the data sections below (do not invent items, counts, statuses, or assignees):`,
+      `1. Newly created yesterday — each item with its ticket, title, status, assignees, and priority if set.`,
+      `2. Items touched yesterday — existing tickets updated yesterday (not newly created), grouped by status, each with ticket, title, current status, assignees, and priority if set.`,
+      `3. Summary counts — total items touched, total new items created, and a breakdown by status.`,
+      `4. Done yesterday — highlight items that moved to Done yesterday as completions; if there are none, say so briefly.`,
+      `Tight bullets, plain text suitable for Telegram, no preamble or sign-off.`,
+      TICKET_FORMAT_INSTRUCTION,
+      ...mdFormattingInstructions(md),
+      ``,
+      `=== Summary counts ===`,
+      `New items created yesterday: ${newItems.length}`,
+      `Existing items touched yesterday: ${touchedItems.length}`,
+      `Items moved to Done yesterday: ${doneYesterday.length}`,
+      `Touched items by status: ${statusCounts || '(none)'}`,
+      ``,
+      `=== Newly created yesterday (${newItems.length}${newItems.length > cappedNew.length ? `, showing first ${cappedNew.length}` : ''}) ===`,
+      cappedNew.length ? cappedNew.map(formatItem).join('\n') : '(none)',
+      ``,
+      `=== Items touched yesterday, grouped by status (${touchedItems.length}${touchedItems.length > cappedTouched.length ? `, showing first ${cappedTouched.length}` : ''}) ===`,
+      touchedDetail || '(none)',
+      ``,
+      `=== Done yesterday (${doneYesterday.length}) ===`,
+      doneYesterday.length ? doneYesterday.map(formatItem).join('\n') : '(none)',
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 1500,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const rawReply = response.content.map(b => b.text ?? '').join('').trim();
+    const reply = linkifyTicketRefs(rawReply, buildUrlMap(items));
+
+    insertMessage.run(chatId, 'user', `[Yesterday activity requested: ${yLabel}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk, sendOpts(md));
+    }
+  } catch (err) {
+    console.error('Yesterday handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't generate yesterday's activity summary: ${err.message}`);
   }
 });
 
