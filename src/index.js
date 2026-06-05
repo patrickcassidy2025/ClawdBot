@@ -1376,61 +1376,97 @@ bot.onText(/^\/yesterday(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       cappedTouched = touchedItems.slice(0, Math.max(0, MAX_ITEMS - cappedNew.length));
     }
 
-    const formatItem = (it) => {
-      const r = ticketRef(it);
-      const ref = r ? `${r} ` : '';
-      const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
-      const pri = it.priority ? ` [priority: ${it.priority}]` : '';
-      const status = it.status || 'No status';
-      return `  - ${ref}${it.title} (status: ${status})${who}${pri}`;
+    const isBlockerPriority = (it) => (it.priority || '').toLowerCase() === 'blocker';
+
+    // Component/label tag — derive from existing Type and Area helpers.
+    const compTag = (it) => {
+      const parts = [];
+      const type = getItemType(it);
+      if (type && type !== 'No Type') parts.push(type);
+      const area = getItemArea(it);
+      if (area && area !== 'No Be Fe') parts.push(area);
+      return parts.length ? ` {${parts.join('/')}}` : '';
     };
 
-    const byStatus = cappedTouched.reduce((acc, it) => {
-      const key = it.status || 'No status';
-      (acc[key] = acc[key] || []).push(it);
-      return acc;
-    }, {});
-    const statusCounts = Object.entries(byStatus)
-      .map(([status, list]) => `${status}: ${list.length}`)
-      .join(', ');
-    const touchedDetail = Object.entries(byStatus)
-      .map(([status, list]) =>
-        `${status} (${list.length}):\n${list.map(formatItem).join('\n')}`)
-      .join('\n\n');
+    const formatItem = (it, { withUpdated = false } = {}) => {
+      const r = ticketRef(it);
+      const ref = r ? `${r} ` : '';
+      const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : ' — (unassigned)';
+      const pri = it.priority ? ` [priority: ${it.priority}]` : '';
+      const flag = isBlockerPriority(it) ? ' [BLOCKER]' : '';
+      const status = it.status || 'No status';
+      const comp = compTag(it);
+      const upd = withUpdated && it.updatedAt
+        ? ` (last updated ${new Date(it.updatedAt).toISOString().slice(0, 10)})`
+        : '';
+      return `  - ${ref}${it.title} (status: ${status})${comp}${who}${pri}${flag}${upd}`;
+    };
+
+    // In Progress tickets with activity yesterday (may include new + touched).
+    const inProgressUpdated = items
+      .filter(it => !isExcluded(it) && (it.status || '').toLowerCase() === 'in progress' && inYesterday(it.updatedAt))
+      .slice(0, 30);
+
+    // Stale In Progress context — not touched since the current stage began,
+    // a proxy for "In Progress across multiple stages".
+    const stage = getCurrentStage();
+    const staleInProgress = items
+      .filter(it => {
+        if (isExcluded(it)) return false;
+        if ((it.status || '').toLowerCase() !== 'in progress') return false;
+        if (!it.updatedAt) return false;
+        const t = new Date(it.updatedAt).getTime();
+        return Number.isFinite(t) && t < stage.startUtc;
+      })
+      .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime())
+      .slice(0, 15);
+
+    const newBlockers = [...cappedNew, ...cappedTouched].filter(isBlockerPriority);
 
     const prompt = [
-      `Write a concise daily activity summary for the GitHub project "${title}" (${url}).`,
+      `Write a narrative morning briefing for a Technical Program Manager about GitHub project "${title}" (${url}).`,
       `Begin with the exact header line: "Activity Summary for ${yLabel}".`,
       `This report covers project board activity for ${yLabel} only (00:00:00–23:59:59 UTC).`,
-      `Keep it factual and brief, not narrative — suitable for a quick morning catch-up: who created what and who updated what yesterday.`,
-      `Cover, in this order, using only the data sections below (do not invent items, counts, statuses, or assignees):`,
-      `1. Newly created yesterday — each item with its ticket, title, status, assignees, and priority if set.`,
-      `2. Items touched yesterday — existing tickets updated yesterday (not newly created), grouped by status, each with ticket, title, current status, assignees, and priority if set.`,
-      `3. Summary counts — total items touched, total new items created, and a breakdown by status.`,
-      `4. Done yesterday — highlight items that moved to Done yesterday as completions; if there are none, say so briefly.`,
-      `Tight bullets, plain text suitable for Telegram, no preamble or sign-off.`,
+      `Use ONLY the data sections below — do not invent tickets, counts, statuses, assignees, or themes not supported by the data.`,
+      ``,
+      `Structure the report into exactly these five sections, with the labels shown (plain text labels followed by a colon or on their own line):`,
+      ``,
+      `Section 1 — Yesterday at a glance: A 2-3 sentence executive summary covering how many tickets were touched, created, and completed. Explicitly call out if any tickets were raised to Blocker priority.`,
+      `Section 2 — Themes and patterns: Analyse the ticket titles and components to identify 3-5 common themes (e.g. "Heavy focus on map features with 8 tickets", "Pipeline work continuing with 5 updates", "3 new LLM-related tickets created"). Synthesise into insights — do NOT list every ticket.`,
+      `Section 3 — In Progress spotlight: For tickets that are In Progress and were touched yesterday, give a brief narrative of what the team appears to be actively working on. Group by theme where possible and name assignees.`,
+      `Section 4 — Completed yesterday: A brief summary only — total count of completions, the main themes of what was finished, and notable individual completions only if they stand out. Do NOT list every ticket.`,
+      `Section 5 — Watch list: Flag concerns — tickets raised to Blocker priority, In Progress tickets that look stale (not updated since the current stage began, per the stale data below), and any patterns that suggest risk. If there are none, say so briefly.`,
+      ``,
+      `Style: professional but readable, suitable for a TPM morning briefing. Lead with insights, not lists — synthesise themes before naming individual tickets, and only cite specific tickets where they support a narrative point. Keep the whole report under 500 words.`,
       TICKET_FORMAT_INSTRUCTION,
       ...mdFormattingInstructions(md),
       ``,
-      `=== Summary counts ===`,
-      `New items created yesterday: ${newItems.length}`,
-      `Existing items touched yesterday: ${touchedItems.length}`,
-      `Items moved to Done yesterday: ${doneYesterday.length}`,
-      `Touched items by status: ${statusCounts || '(none)'}`,
+      `=== Counts ===`,
+      `New tickets created yesterday: ${newItems.length}`,
+      `Existing tickets updated yesterday (not new): ${touchedItems.length}`,
+      `In Progress tickets with activity yesterday: ${inProgressUpdated.length}`,
+      `Tickets completed (Done) yesterday: ${doneYesterday.length}`,
+      `Tickets at Blocker priority among yesterday's activity: ${newBlockers.length}`,
       ``,
-      `=== Newly created yesterday (${newItems.length}${newItems.length > cappedNew.length ? `, showing first ${cappedNew.length}` : ''}) ===`,
-      cappedNew.length ? cappedNew.map(formatItem).join('\n') : '(none)',
+      `=== Newly created tickets yesterday (${newItems.length}${newItems.length > cappedNew.length ? `, showing first ${cappedNew.length}` : ''}) ===`,
+      cappedNew.length ? cappedNew.map(it => formatItem(it)).join('\n') : '(none)',
       ``,
-      `=== Items touched yesterday, grouped by status (${touchedItems.length}${touchedItems.length > cappedTouched.length ? `, showing first ${cappedTouched.length}` : ''}) ===`,
-      touchedDetail || '(none)',
+      `=== Tickets updated yesterday, not new ([BLOCKER] marks current Blocker priority) (${touchedItems.length}${touchedItems.length > cappedTouched.length ? `, showing first ${cappedTouched.length}` : ''}) ===`,
+      cappedTouched.length ? cappedTouched.map(it => formatItem(it)).join('\n') : '(none)',
+      ``,
+      `=== In Progress tickets with activity yesterday (${inProgressUpdated.length}) ===`,
+      inProgressUpdated.length ? inProgressUpdated.map(it => formatItem(it)).join('\n') : '(none)',
       ``,
       `=== Done yesterday (${doneYesterday.length}) ===`,
-      doneYesterday.length ? doneYesterday.map(formatItem).join('\n') : '(none)',
+      doneYesterday.length ? doneYesterday.map(it => formatItem(it)).join('\n') : '(none)',
+      ``,
+      `=== Stale In Progress — not updated since the current stage (${stage.label}) began on ${new Date(stage.startUtc).toISOString().slice(0, 10)} (${staleInProgress.length}) ===`,
+      staleInProgress.length ? staleInProgress.map(it => formatItem(it, { withUpdated: true })).join('\n') : '(none)',
     ].join('\n');
 
     const response = await anthropic.messages.create({
       model: 'claude-opus-4-5',
-      max_tokens: 1500,
+      max_tokens: 1200,
       system: systemPrompt,
       messages: [{ role: 'user', content: prompt }],
     });
