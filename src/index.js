@@ -1346,78 +1346,103 @@ bot.onText(/^\/yesterday(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
 
     const isBlockerPriority = (it) => (it.priority || '').toLowerCase() === 'blocker';
 
-    // Table source lists (Won't do / Cancelled already excluded by isExcluded).
-    // Table 1: Closed yesterday — status Done whose updatedAt falls in yesterday.
-    const closedYesterday = items.filter(it =>
-      !isExcluded(it) && (it.status || '').toLowerCase() === 'done' && inYesterday(it.updatedAt));
-    // Table 2: In Progress with NO activity yesterday.
-    const inProgressNoActivity = items.filter(it =>
-      !isExcluded(it) && (it.status || '').toLowerCase() === 'in progress' && !inYesterday(it.updatedAt));
-    // Table 3: Created yesterday, regardless of current status.
-    const createdYesterday = items.filter(it => !isExcluded(it) && inYesterday(it.createdAt));
+    const esc = (s) => String(s ?? '').replace(/\s*\n\s*/g, ' ').trim() || '—';
+    const who = (it) => it.assignees.length ? it.assignees.map(a => `@${a}`).join(', ') : 'unassigned';
+    const num = (it) => it.number ? `#${it.number}` : '#—';
+    const dateOf = (iso) => iso ? new Date(iso).toISOString().slice(0, 10) : '—';
 
-    if (!closedYesterday.length && !inProgressNoActivity.length && !createdYesterday.length) {
-      const empty = `${yLabel} — Touched: 0 | Created: 0 | Closed: 0 | In Progress: 0 | Blockers raised: 0\n\nNo project board activity to report.`;
-      insertMessage.run(chatId, 'user', `[Yesterday activity requested: ${yLabel}]`, Date.now());
-      insertMessage.run(chatId, 'assistant', empty, Date.now());
-      await bot.sendMessage(chatId, empty, sendOpts(md));
-      return;
+    const stage = getCurrentStage();
+    const stageStartLabel = new Date(stage.startUtc).toISOString().slice(0, 10);
+
+    // Section 1: Closed this stage (uses the shared completed-in-stage logic).
+    const closedThisStage = items.filter(it => !isExcluded(it) && wasCompletedThisStage(it, stage));
+
+    const PRIORITY_BUCKETS = ['Blocker', 'High', 'Medium', 'Low'];
+    const priorityCounts = Object.fromEntries(PRIORITY_BUCKETS.map(p => [p, 0]));
+    let priorityUnset = 0;
+    for (const it of closedThisStage) {
+      const p = (it.priority || '').toLowerCase();
+      const bucket = PRIORITY_BUCKETS.find(b => b.toLowerCase() === p);
+      if (bucket) priorityCounts[bucket] += 1; else priorityUnset += 1;
     }
+    const priorityLine = PRIORITY_BUCKETS.map(b => `${b}: ${priorityCounts[b]}`).join(', ')
+      + (priorityUnset ? `, Unset: ${priorityUnset}` : '');
 
-    // Summary counts — full totals, computed before the per-table 50-row cap.
+    const assigneeCount = new Map();
+    for (const it of closedThisStage) {
+      if (!it.assignees.length) {
+        assigneeCount.set('(unassigned)', (assigneeCount.get('(unassigned)') || 0) + 1);
+        continue;
+      }
+      for (const a of it.assignees) assigneeCount.set(a, (assigneeCount.get(a) || 0) + 1);
+    }
+    const topAssignees = [...assigneeCount.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([a, c]) => `${a === '(unassigned)' ? '(unassigned)' : '@' + a}: ${c}`);
+
+    // Closed-ticket data passed for theme analysis only — not to be listed.
+    const closedThemeData = closedThisStage.slice(0, 60)
+      .map(it => `- ${esc(it.title)} [${it.priority || 'No priority'}]`);
+
+    // Section 2: In Progress with no activity this stage (updatedAt before stage start).
+    const SECTION_CAP = 30;
+    const inProgressStaleStage = items
+      .filter(it => {
+        if (isExcluded(it)) return false;
+        if ((it.status || '').toLowerCase() !== 'in progress') return false;
+        if (!it.updatedAt) return false;
+        const t = new Date(it.updatedAt).getTime();
+        return Number.isFinite(t) && t < stage.startUtc;
+      })
+      .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
+    const section2Lines = inProgressStaleStage.slice(0, SECTION_CAP).map(it =>
+      `${num(it)} — ${esc(it.title)} (${who(it)}) [${it.priority || 'No priority'}] — Last updated: ${dateOf(it.updatedAt)}`);
+
+    // Section 3: Created yesterday, regardless of current status.
+    const createdYesterday = items.filter(it => !isExcluded(it) && inYesterday(it.createdAt));
+    const section3Lines = createdYesterday.slice(0, SECTION_CAP).map(it =>
+      `${num(it)} — ${esc(it.title)} (${who(it)}) [${it.priority || 'No priority'}] [${it.status || 'No status'}]`);
+
+    // Summary line counts — daily pulse (yesterday-scoped) plus current In Progress total.
     const touchedCount = items.filter(it => !isExcluded(it) && inYesterday(it.updatedAt)).length;
+    const closedYesterdayCount = items.filter(it =>
+      !isExcluded(it) && (it.status || '').toLowerCase() === 'done' && inYesterday(it.updatedAt)).length;
     const inProgressTotal = items.filter(it =>
       !isExcluded(it) && (it.status || '').toLowerCase() === 'in progress').length;
     const blockersRaised = items.filter(it =>
       !isExcluded(it) && isBlockerPriority(it) && (inYesterday(it.updatedAt) || inYesterday(it.createdAt))).length;
 
-    const ROW_CAP = 50;
-    const esc = (s) => String(s ?? '').replace(/\|/g, '\\|').replace(/\s*\n\s*/g, ' ').trim() || '—';
-    const who = (it) => it.assignees.length ? it.assignees.map(a => `@${a}`).join(', ') : '—';
-    const pri = (it) => it.priority || '—';
-    const num = (it) => it.number ? `#${it.number}` : '—';
-    const dateOf = (iso) => iso ? new Date(iso).toISOString().slice(0, 10) : '—';
-
-    const rows1 = closedYesterday.slice(0, ROW_CAP)
-      .map(it => `${num(it)} | ${esc(it.title)} | ${who(it)} | ${pri(it)}`);
-    const rows2 = inProgressNoActivity.slice(0, ROW_CAP)
-      .map(it => `${num(it)} | ${esc(it.title)} | ${who(it)} | ${pri(it)} | ${dateOf(it.updatedAt)}`);
-    const rows3 = createdYesterday.slice(0, ROW_CAP)
-      .map(it => `${num(it)} | ${esc(it.title)} | ${who(it)} | ${pri(it)} | ${esc(it.status || 'No status')}`);
-
-    const summaryLine = `${yLabel} — Touched: ${touchedCount} | Created: ${createdYesterday.length} | Closed: ${closedYesterday.length} | In Progress: ${inProgressTotal} | Blockers raised: ${blockersRaised}`;
+    const summaryLine = `${yLabel} — Touched: ${touchedCount} | Created: ${createdYesterday.length} | Closed: ${closedYesterdayCount} | In Progress: ${inProgressTotal} | Blockers raised: ${blockersRaised}`;
 
     const prompt = [
       `Generate a compact, factual daily activity report for the GitHub project "${title}".`,
-      `Reproduce the data below verbatim. Do not add, drop, reorder, reword, or summarise any row.`,
+      `Current stage: ${stage.label} (started ${stageStartLabel}).`,
       ``,
       `STRICT RULES:`,
-      `- Factual only. No opinions, pleasantries, or subjective assessments. Never write phrases like "highly productive", "great progress", or "the team did well".`,
-      `- No URLs and no ticket links anywhere. The "#" column is the bare ticket number only.`,
-      `- No narrative paragraphs, no section intros or conclusions, no watch list, no themes section.`,
-      `- Do not editorialize or add any commentary beyond the data shown.`,
-      `- Output the summary line first, then the three tables in order, and nothing else.`,
-      `- Render each table as a GitHub-style markdown table using exactly the column headers given.`,
-      `- Above each table, print its count line exactly as written below.`,
-      `- If a table's rows are "(none)", print its count line and write "None" instead of the table.`,
+      `- Factual only. No pleasantries or subjective praise. Never write phrases like "highly productive", "great progress", or "the team did well".`,
+      `- No URLs and no ticket links anywhere. Use the bare "#NUMBER" form only.`,
+      `- Do NOT use markdown tables. Use plain structured text with " — " (space-hyphen-space) as the field separator, exactly as shown in the data lines below.`,
+      `- Reproduce every data line in Sections 2 and 3 verbatim — do not add, drop, reorder, reword, or summarise, and add NO narrative in those sections.`,
+      `- Commentary/insight is allowed ONLY in Section 1's closing sentence(s), and only where directly supported by the data (e.g. "8 of 12 closed were Medium priority" or "work concentrated on two assignees").`,
+      `- Output the summary line first, then the three sections in order with the exact section headers shown, and nothing else.`,
       ``,
-      `=== SUMMARY LINE (output this exactly as the first line) ===`,
+      `=== LINE 1 — SUMMARY (output exactly, as the first line) ===`,
       summaryLine,
       ``,
-      `=== TABLE 1 — count line: "Closed: ${closedYesterday.length}" ===`,
-      `Columns: # | Title | Assignee | Priority`,
-      `Rows:`,
-      rows1.length ? rows1.join('\n') : '(none)',
+      `=== SECTION 1 — print the header "Closed this stage" then, each on its own line: ===`,
+      `Total closed this stage: ${closedThisStage.length}`,
+      `By priority: ${priorityLine}`,
+      `Top assignees: ${topAssignees.length ? topAssignees.join(', ') : 'None'}`,
+      `Then add ONE or TWO sentences of factual insight (dominant themes, concentration of work, notable patterns) drawn ONLY from the closed-ticket data below. Do NOT list the tickets individually.`,
+      `Closed-ticket data for theme analysis only (do NOT reproduce as a list):`,
+      closedThisStage.length ? closedThemeData.join('\n') : '(none closed this stage)',
       ``,
-      `=== TABLE 2 — count line: "In Progress (no activity yesterday): ${inProgressNoActivity.length}" ===`,
-      `Columns: # | Title | Assignee | Priority | Last Updated`,
-      `Rows:`,
-      rows2.length ? rows2.join('\n') : '(none)',
+      `=== SECTION 2 — print the header "In Progress: no activity this stage" then output these lines verbatim (if "None", output just: None) ===`,
+      section2Lines.length ? section2Lines.join('\n') : 'None',
       ``,
-      `=== TABLE 3 — count line: "Created: ${createdYesterday.length}" ===`,
-      `Columns: # | Title | Assignee | Priority | Status`,
-      `Rows:`,
-      rows3.length ? rows3.join('\n') : '(none)',
+      `=== SECTION 3 — print the header "Created yesterday" then output these lines verbatim (if "None", output just: None) ===`,
+      section3Lines.length ? section3Lines.join('\n') : 'None',
     ].join('\n');
 
     const response = await anthropic.messages.create({
