@@ -130,6 +130,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/metrics status — check if the dashboard is running',
     '/project — daily summary of the GitHub project board',
     '/yesterday — summary of project board activity from yesterday (UTC)',
+    '/qa — QA pipeline summary for yesterday (UTC)',
     '/standup — yesterday/today/blockers standup update',
     '/retrospective — sprint retrospective for the current stage',
     '/new — new tickets created during the current stage, grouped by Type and Area',
@@ -1447,6 +1448,131 @@ bot.onText(/^\/yesterday(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
   } catch (err) {
     console.error('Yesterday handler error:', err);
     await bot.sendMessage(chatId, `Couldn't generate yesterday's activity summary: ${err.message}`);
+  }
+});
+
+bot.onText(/^\/qa(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+  const md = !!(match && match[1]);
+
+  const org = process.env.GITHUB_PROJECT_ORG;
+  const number = Number(process.env.GITHUB_PROJECT_NUMBER);
+  if (!org || !Number.isInteger(number)) {
+    await bot.sendMessage(chatId, 'Project board not configured: set GITHUB_PROJECT_ORG and GITHUB_PROJECT_NUMBER.');
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+    const { items, title } = await fetchProjectItems(org, number);
+
+    if (!items.length) {
+      await bot.sendMessage(chatId, `Project "${title}" has no items.`);
+      return;
+    }
+
+    const now = new Date();
+    const yesterdayStart = new Date(Date.UTC(
+      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 0, 0, 0));
+    const yesterdayEnd = new Date(Date.UTC(
+      now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 23, 59, 59));
+    const ys = yesterdayStart.getTime();
+    const ye = yesterdayEnd.getTime();
+    const yLabel = yesterdayStart.toLocaleDateString('en-GB', {
+      day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC',
+    });
+
+    const inYesterday = (iso) => {
+      if (!iso) return false;
+      const t = new Date(iso).getTime();
+      return Number.isFinite(t) && t >= ys && t <= ye;
+    };
+    const beforeYesterday = (iso) => {
+      if (!iso) return false;
+      const t = new Date(iso).getTime();
+      return Number.isFinite(t) && t < ys;
+    };
+    const isExcluded = (it) => {
+      const status = (it.status || '').toLowerCase();
+      return status === "won't do" || status === 'cancelled';
+    };
+    const statusIs = (it, s) => (it.status || '').toLowerCase() === s.toLowerCase();
+
+    const esc = (s) => String(s ?? '').replace(/\s*\n\s*/g, ' ').trim() || '—';
+    const who = (it) => it.assignees.length ? it.assignees.map(a => `@${a}`).join(', ') : 'unassigned';
+    const num = (it) => it.number ? `#${it.number}` : '#—';
+    const dateOf = (iso) => iso ? new Date(iso).toISOString().slice(0, 10) : '—';
+    const line = (it) => `${num(it)} — ${esc(it.title)} (${who(it)}) [${it.priority || 'No priority'}]`;
+
+    const SECTION_CAP = 30;
+    const active = items.filter(it => !isExcluded(it));
+
+    // Section 1: moved into the QA queue yesterday.
+    const intoQA = active.filter(it => statusIs(it, 'Ready for test') && inYesterday(it.updatedAt));
+    // Section 2: passed QA (Done) yesterday.
+    const passed = active.filter(it => statusIs(it, 'Done') && inYesterday(it.updatedAt));
+    // Section 3: sent back for rework (Reopened) yesterday.
+    const rework = active.filter(it => statusIs(it, 'Reopened') && inYesterday(it.updatedAt));
+    // Section 4: sitting in QA with no activity yesterday — backlog.
+    const backlog = active
+      .filter(it => statusIs(it, 'Ready for test') && beforeYesterday(it.updatedAt))
+      .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
+
+    const section1Lines = intoQA.map(line);
+    const section2Lines = passed.map(line);
+    const section3Lines = rework.map(line);
+    const section4Lines = backlog.slice(0, SECTION_CAP).map(it =>
+      `${line(it)} — Waiting since: ${dateOf(it.updatedAt)}`);
+
+    const summaryLine = `QA Summary ${yLabel} — Into QA: ${intoQA.length} | Passed (Done): ${passed.length} | Rework: ${rework.length} | QA backlog: ${backlog.length}`;
+
+    const prompt = [
+      `Generate a compact, factual QA pipeline report for the GitHub project "${title}".`,
+      ``,
+      `STRICT RULES:`,
+      `- Factual only. No pleasantries, opinions, or subjective praise.`,
+      `- No URLs and no ticket links anywhere. Use the bare "#NUMBER" form only.`,
+      `- Do NOT use markdown tables. Use plain structured text with " — " (space-hyphen-space) as the field separator, exactly as shown in the data lines below.`,
+      `- Reproduce every data line in Sections 1–4 verbatim — do not add, drop, reorder, reword, or summarise.`,
+      `- Output the summary line first, then the five sections in order with the exact section headers shown, and nothing else.`,
+      ``,
+      `=== LINE 1 — SUMMARY (output exactly, as the first line) ===`,
+      summaryLine,
+      ``,
+      `=== SECTION 1 — print the header "Moved to Ready for test" then output these lines verbatim (if "None", output just: None) ===`,
+      section1Lines.length ? section1Lines.join('\n') : 'None',
+      ``,
+      `=== SECTION 2 — print the header "Passed QA (moved to Done)" then output these lines verbatim (if "None", output just: None) ===`,
+      section2Lines.length ? section2Lines.join('\n') : 'None',
+      ``,
+      `=== SECTION 3 — print the header "Sent back for rework (Reopened)" then output these lines verbatim (if "None", output just: None) ===`,
+      section3Lines.length ? section3Lines.join('\n') : 'None',
+      ``,
+      `=== SECTION 4 — print the header "QA backlog (Ready for test, no activity yesterday)" then output these lines verbatim (if "None", output just: None) ===`,
+      section4Lines.length ? section4Lines.join('\n') : 'None',
+      ``,
+      `=== SECTION 5 — print the header "Insight" then add 2-3 sentences MAX of factual observation drawn ONLY from the data above. Cover: QA throughput ratio (passed vs entered), whether the backlog grew or shrank, and any pattern in rework (same assignee or component). State only what the data supports; no opinions or recommendations. ===`,
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 2000,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    // No linkify — this report intentionally contains no URLs or ticket links.
+    const reply = response.content.map(b => b.text ?? '').join('').trim();
+
+    insertMessage.run(chatId, 'user', `[QA summary requested: ${yLabel}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk, sendOpts(md));
+    }
+  } catch (err) {
+    console.error('QA handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't generate QA summary: ${err.message}`);
   }
 });
 
