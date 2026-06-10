@@ -131,6 +131,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/project — daily summary of the GitHub project board',
     '/yesterday — summary of project board activity from yesterday (UTC)',
     '/qa — QA pipeline summary for yesterday (UTC)',
+    '/scoreboard — ticket counts per assignee for the current stage',
     '/standup — yesterday/today/blockers standup update',
     '/retrospective — sprint retrospective for the current stage',
     '/new — new tickets created during the current stage, grouped by Type and Area',
@@ -1573,6 +1574,113 @@ bot.onText(/^\/qa(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
   } catch (err) {
     console.error('QA handler error:', err);
     await bot.sendMessage(chatId, `Couldn't generate QA summary: ${err.message}`);
+  }
+});
+
+bot.onText(/^\/scoreboard(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+  const md = !!(match && match[1]);
+
+  const org = process.env.GITHUB_PROJECT_ORG;
+  const number = Number(process.env.GITHUB_PROJECT_NUMBER);
+  if (!org || !Number.isInteger(number)) {
+    await bot.sendMessage(chatId, 'Project board not configured: set GITHUB_PROJECT_ORG and GITHUB_PROJECT_NUMBER.');
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+    const { items, title } = await fetchProjectItems(org, number);
+
+    if (!items.length) {
+      await bot.sendMessage(chatId, `Project "${title}" has no items.`);
+      return;
+    }
+
+    const stage = getCurrentStage();
+
+    const isExcluded = (it) => {
+      const status = (it.status || '').toLowerCase();
+      return status === "won't do" || status === 'cancelled';
+    };
+    const IN_PROGRESS_STATUSES = new Set(['in progress', 'in review', 'ready for test']);
+
+    // Per-assignee tally for the current stage. Multi-assignee tickets count once per assignee.
+    const board = new Map(); // assignee -> { todo, inProgress, done }
+    const bump = (assignee, key) => {
+      if (!board.has(assignee)) board.set(assignee, { todo: 0, inProgress: 0, done: 0 });
+      board.get(assignee)[key] += 1;
+    };
+
+    for (const it of items) {
+      if (isExcluded(it)) continue;
+      if (!it.assignees || !it.assignees.length) continue; // skip unassigned
+
+      const status = (it.status || '').toLowerCase();
+      let key = null;
+      if (status === 'done') {
+        if (wasCompletedThisStage(it, stage)) key = 'done';
+      } else if (isInCurrentStage(it, stage)) {
+        if (status === 'todo') key = 'todo';
+        else if (IN_PROGRESS_STATUSES.has(status)) key = 'inProgress';
+      }
+      if (!key) continue;
+
+      for (const assignee of it.assignees) bump(assignee, key);
+    }
+
+    const rows = [...board.entries()]
+      .map(([assignee, c]) => ({ assignee, ...c, total: c.todo + c.inProgress + c.done }))
+      .filter(r => r.total > 0)
+      .sort((a, b) => (b.done - a.done) || (b.inProgress - a.inProgress));
+
+    const rowLines = rows.map(r =>
+      `@${r.assignee} — To Do: ${r.todo} | In Progress: ${r.inProgress} | Done: ${r.done} | Total: ${r.total}`);
+
+    const totals = rows.reduce((acc, r) => {
+      acc.todo += r.todo; acc.inProgress += r.inProgress; acc.done += r.done; return acc;
+    }, { todo: 0, inProgress: 0, done: 0 });
+
+    const headerLine = `Scoreboard — ${stage.label} (${stage.startLabel} to ${stage.endLabel})`;
+    const totalLine = `Total — To Do: ${totals.todo} | In Progress: ${totals.inProgress} | Done: ${totals.done}`;
+
+    const prompt = [
+      `Generate a compact, factual per-assignee scoreboard for the GitHub project "${title}".`,
+      ``,
+      `STRICT RULES:`,
+      `- Counts only. No ticket titles or numbers, no narrative paragraphs, no opinions or pleasantries.`,
+      `- Do NOT use markdown tables. Reproduce the data lines below verbatim — do not add, drop, reorder, reword, or summarise.`,
+      `- Output the header line first, then every assignee line in the given order, then the total line last, and nothing else.`,
+      ``,
+      `=== HEADER (output exactly, as the first line) ===`,
+      headerLine,
+      ``,
+      `=== ASSIGNEE LINES (output verbatim, in order; if "None", output just: None) ===`,
+      rowLines.length ? rowLines.join('\n') : 'None',
+      ``,
+      `=== TOTAL LINE (output exactly, as the last line) ===`,
+      totalLine,
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 2000,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    // No linkify — this report intentionally contains no URLs or ticket links.
+    const reply = response.content.map(b => b.text ?? '').join('').trim();
+
+    insertMessage.run(chatId, 'user', `[Scoreboard requested: ${stage.label}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk, sendOpts(md));
+    }
+  } catch (err) {
+    console.error('Scoreboard handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't generate scoreboard: ${err.message}`);
   }
 });
 
