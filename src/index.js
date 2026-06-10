@@ -1635,7 +1635,6 @@ bot.onText(/^\/scoreboard(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
       const status = (it.status || '').toLowerCase();
       return status === "won't do" || status === 'cancelled';
     };
-    const IN_PROGRESS_STATUSES = new Set(['in progress', 'in review', 'ready for test']);
     const esc = (s) => String(s ?? '').replace(/\s*\n\s*/g, ' ').trim() || '—';
     const ts = (iso) => iso ? new Date(iso).toISOString().slice(0, 19).replace('T', ' ') : '—';
 
@@ -1713,52 +1712,51 @@ bot.onText(/^\/scoreboard(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
 
     // ---- NORMAL MODE ----
     // Per-assignee tally for the current stage. Multi-assignee tickets count once per assignee.
-    const board = new Map(); // assignee -> { todo, inProgress, done }
+    // Buckets: To Do, In Progress (status === 'in progress' ONLY), Done, and
+    // Other (every remaining staged, non-excluded status: Backlog, Reopened,
+    // In Review, Need Merge, Ready for test, Waiting for related task, On hold…).
+    const board = new Map(); // assignee -> { todo, inProgress, other, done }
     const bump = (assignee, key) => {
-      if (!board.has(assignee)) board.set(assignee, { todo: 0, inProgress: 0, done: 0 });
+      if (!board.has(assignee)) board.set(assignee, { todo: 0, inProgress: 0, other: 0, done: 0 });
       board.get(assignee)[key] += 1;
     };
 
     for (const it of items) {
       if (isExcluded(it)) continue;
       if (!it.assignees || !it.assignees.length) continue; // skip unassigned
+      if (!isInCurrentStage(it, stage)) continue; // ignore tickets not staged for this stage
 
-      // Scope every bucket by current-stage membership (iteration tag, or
-      // createdAt fallback) so Done matches the board's iteration-filtered
-      // Done column — not GitHub's closedAt timestamp.
       const status = (it.status || '').toLowerCase();
-      let key = null;
-      if (isInCurrentStage(it, stage)) {
-        if (status === 'done') key = 'done';
-        else if (status === 'todo') key = 'todo';
-        else if (IN_PROGRESS_STATUSES.has(status)) key = 'inProgress';
-      }
-      if (!key) continue;
+      let key;
+      if (status === 'done') key = 'done';
+      else if (status === 'todo' || status === 'to do') key = 'todo';
+      else if (status === 'in progress') key = 'inProgress';
+      else key = 'other'; // any other staged status
 
       for (const assignee of it.assignees) bump(assignee, key);
     }
 
     const rows = [...board.entries()]
-      .map(([assignee, c]) => ({ assignee, ...c, total: c.todo + c.inProgress + c.done }))
+      .map(([assignee, c]) => ({ assignee, ...c, total: c.todo + c.inProgress + c.other + c.done }))
       .filter(r => r.total > 0)
       .sort((a, b) => (b.done - a.done) || (b.inProgress - a.inProgress));
 
     const rowLines = rows.map(r =>
-      `@${r.assignee} — To Do: ${r.todo} | In Progress: ${r.inProgress} | Done: ${r.done} | Total: ${r.total}`);
+      `@${r.assignee} — To Do: ${r.todo} | In Progress: ${r.inProgress} | Other: ${r.other} | Done: ${r.done} | Total: ${r.total}`);
 
     const totals = rows.reduce((acc, r) => {
-      acc.todo += r.todo; acc.inProgress += r.inProgress; acc.done += r.done; return acc;
-    }, { todo: 0, inProgress: 0, done: 0 });
+      acc.todo += r.todo; acc.inProgress += r.inProgress; acc.other += r.other; acc.done += r.done; return acc;
+    }, { todo: 0, inProgress: 0, other: 0, done: 0 });
 
     // Server-side verification log (visible via `journalctl -u clawdbot -f`).
     const inStageCount = items.filter(it => isInCurrentStage(it, stage)).length;
     console.log(`[scoreboard] ${stage.label}: fetched ${items.length} items from board; ${inStageCount} pass isInCurrentStage()`);
     for (const r of rows) {
-      console.log(`[scoreboard] @${r.assignee}: stage total ${r.total} — To Do ${r.todo}, In Progress ${r.inProgress}, Done ${r.done}`);
+      console.log(`[scoreboard] @${r.assignee}: stage total ${r.total} — To Do ${r.todo}, In Progress ${r.inProgress}, Other ${r.other}, Done ${r.done}`);
     }
 
     const headerLine = `Scoreboard — ${stage.label} (${stage.startLabel} to ${stage.endLabel})`;
-    const totalLine = `Total — To Do: ${totals.todo} | In Progress: ${totals.inProgress} | Done: ${totals.done}`;
+    const totalLine = `Total — To Do: ${totals.todo} | In Progress: ${totals.inProgress} | Other: ${totals.other} | Done: ${totals.done}`;
 
     const prompt = [
       `Generate a compact, factual per-assignee scoreboard for the GitHub project "${title}".`,
