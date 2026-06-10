@@ -715,6 +715,39 @@ function wasCompletedThisStage(item, stage) {
   return isInCurrentStage(item, stage);
 }
 
+// Diagnostic: explain which stage-membership rule an item matched (or why it
+// didn't). Mirrors the logic of isInCurrentStage()/wasCompletedThisStage().
+// Used only by /scoreboard debug to keep verification transparent.
+function classifyStageMatch(item, stage) {
+  const status = (item.status || '').toLowerCase();
+  // Pass 2: Done items are counted via their closedAt falling in the window.
+  if (status === 'done' && item.closedAt) {
+    const t = new Date(item.closedAt).getTime();
+    if (Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc) {
+      return 'pass2-done: closedAt within stage window';
+    }
+    return 'no-match: Done but closedAt outside stage window';
+  }
+  // Pass 1: explicit iteration assignment wins when present.
+  if (item.iterationTitle) {
+    const m = item.iterationTitle.match(/(\d+)/);
+    if (!m) return `no-match: iterationTitle "${item.iterationTitle}" has no number`;
+    const n = parseInt(m[1], 10);
+    return n === stage.number
+      ? `pass1-iteration: iterationTitle resolves to stage ${n}`
+      : `no-match: iterationTitle stage ${n} != current stage ${stage.number}`;
+  }
+  // Pass 1 fallback: no iteration set, fall back to createdAt membership.
+  if (item.createdAt) {
+    const ct = new Date(item.createdAt).getTime();
+    if (Number.isFinite(ct) && ct >= stage.startUtc && ct < stage.endUtc) {
+      return 'pass1-fallback: no iterationTitle, createdAt within stage window';
+    }
+    return 'no-match: no iterationTitle, createdAt outside stage window';
+  }
+  return 'no-match: no iterationTitle and no createdAt';
+}
+
 const TYPE_BUCKETS = ['Bug', 'Feature', 'Story', 'Task'];
 const TYPE_FIELD_KEYS = ['type', 'issue type', 'kind'];
 
@@ -1577,10 +1610,17 @@ bot.onText(/^\/qa(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
   }
 });
 
-bot.onText(/^\/scoreboard(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
+bot.onText(/^\/scoreboard(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   if (await rateLimited(chatId)) return;
-  const md = !!(match && match[1]);
+
+  const arg = (match && match[1] ? match[1].trim() : '');
+  const lower = arg.toLowerCase();
+  const md = lower === 'in md';
+  const isRaw = lower === 'raw';
+  const debugMatch = arg.match(/^debug\b\s*@?(.*)$/i);
+  const isDebug = !!debugMatch;
+  const debugAssignee = isDebug ? debugMatch[1].trim().replace(/^@/, '') : null;
 
   const org = process.env.GITHUB_PROJECT_ORG;
   const number = Number(process.env.GITHUB_PROJECT_NUMBER);
@@ -1605,7 +1645,82 @@ bot.onText(/^\/scoreboard(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
       return status === "won't do" || status === 'cancelled';
     };
     const IN_PROGRESS_STATUSES = new Set(['in progress', 'in review', 'ready for test']);
+    const esc = (s) => String(s ?? '').replace(/\s*\n\s*/g, ' ').trim() || '—';
+    const ts = (iso) => iso ? new Date(iso).toISOString().slice(0, 19).replace('T', ' ') : '—';
 
+    // ---- DEBUG MODE: dump one assignee's items for manual verification ----
+    if (isDebug) {
+      if (!debugAssignee) {
+        await bot.sendMessage(chatId, 'Usage: /scoreboard debug @assignee');
+        return;
+      }
+      const target = debugAssignee.toLowerCase();
+      const mine = items.filter(it => (it.assignees || []).some(a => a.toLowerCase() === target));
+      const inStage = mine.filter(it => isInCurrentStage(it, stage));
+
+      const countByStatus = (arr) => {
+        const m = {};
+        for (const it of arr) { const s = it.status || 'No status'; m[s] = (m[s] || 0) + 1; }
+        return Object.entries(m).sort((a, b) => b[1] - a[1])
+          .map(([s, c]) => `${s}: ${c}`).join(' | ') || 'none';
+      };
+
+      const DISPLAY_CAP = 100;
+      const lines = [
+        `Scoreboard DEBUG — @${debugAssignee} — ${stage.label} (${stage.startLabel} to ${stage.endLabel})`,
+        `Total items assigned on board: ${mine.length}`,
+        `Items where isInCurrentStage() is true: ${inStage.length}`,
+        `Status breakdown (ALL items): ${countByStatus(mine)}`,
+        `Status breakdown (current stage only): ${countByStatus(inStage)}`,
+        ``,
+        `Items (capped at ${DISPLAY_CAP}):`,
+      ];
+      for (const it of mine.slice(0, DISPLAY_CAP)) {
+        const inCur = isInCurrentStage(it, stage);
+        const pass = classifyStageMatch(it, stage);
+        console.log(
+          `[scoreboard debug] @${debugAssignee} #${it.number ?? '—'} status="${it.status || ''}" ` +
+          `isInCurrentStage=${inCur} → ${pass}`);
+        lines.push(
+          `#${it.number ?? '—'} — ${esc(it.title)} — ${it.status || 'No status'} — ` +
+          `${it.priority || 'No priority'} — updated ${ts(it.updatedAt)} — ` +
+          `isInCurrentStage: ${inCur} — closedAt ${ts(it.closedAt)} — iteration ${it.iterationTitle || '—'}`);
+      }
+      if (mine.length > DISPLAY_CAP) lines.push(`… ${mine.length - DISPLAY_CAP} more not shown.`);
+
+      const out = lines.join('\n');
+      for (const chunk of chunkMessage(out)) await bot.sendMessage(chatId, chunk, sendOpts(md));
+      return;
+    }
+
+    // ---- RAW MODE: raw numbers straight from the data, no AI generation ----
+    if (isRaw) {
+      const inStage = items.filter(it => isInCurrentStage(it, stage));
+      const statusCounts = {};
+      for (const it of inStage) { const s = it.status || 'No status'; statusCounts[s] = (statusCounts[s] || 0) + 1; }
+      const assigneeCounts = new Map();
+      for (const it of inStage) for (const a of (it.assignees || [])) {
+        assigneeCounts.set(a, (assigneeCounts.get(a) || 0) + 1);
+      }
+      const top = [...assigneeCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+
+      const lines = [
+        `Scoreboard RAW — ${stage.label} (${stage.startLabel} to ${stage.endLabel})`,
+        `Total items on board: ${items.length}`,
+        `Total items in current stage (isInCurrentStage): ${inStage.length}`,
+        ``,
+        `Status breakdown (current stage):`,
+        ...Object.entries(statusCounts).sort((a, b) => b[1] - a[1]).map(([s, c]) => `  ${s}: ${c}`),
+        ``,
+        `Top 10 assignees by item count (current stage):`,
+        ...(top.length ? top.map(([a, c], i) => `  ${i + 1}. @${a}: ${c}`) : ['  None']),
+      ];
+      const out = lines.join('\n');
+      for (const chunk of chunkMessage(out)) await bot.sendMessage(chatId, chunk, sendOpts(md));
+      return;
+    }
+
+    // ---- NORMAL MODE ----
     // Per-assignee tally for the current stage. Multi-assignee tickets count once per assignee.
     const board = new Map(); // assignee -> { todo, inProgress, done }
     const bump = (assignee, key) => {
@@ -1641,6 +1756,13 @@ bot.onText(/^\/scoreboard(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     const totals = rows.reduce((acc, r) => {
       acc.todo += r.todo; acc.inProgress += r.inProgress; acc.done += r.done; return acc;
     }, { todo: 0, inProgress: 0, done: 0 });
+
+    // Server-side verification log (visible via `journalctl -u clawdbot -f`).
+    const inStageCount = items.filter(it => isInCurrentStage(it, stage)).length;
+    console.log(`[scoreboard] ${stage.label}: fetched ${items.length} items from board; ${inStageCount} pass isInCurrentStage()`);
+    for (const r of rows) {
+      console.log(`[scoreboard] @${r.assignee}: stage total ${r.total} — To Do ${r.todo}, In Progress ${r.inProgress}, Done ${r.done}`);
+    }
 
     const headerLine = `Scoreboard — ${stage.label} (${stage.startLabel} to ${stage.endLabel})`;
     const totalLine = `Total — To Do: ${totals.todo} | In Progress: ${totals.inProgress} | Done: ${totals.done}`;
