@@ -1724,8 +1724,12 @@ bot.onText(/^\/scoreboard(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
     for (const it of items) {
       if (isExcluded(it)) continue;
       if (!it.assignees || !it.assignees.length) continue; // skip unassigned
-      if (!isInCurrentStage(it, stage)) continue; // ignore tickets not staged for this stage
+      if (!isInCurrentStage(it, stage)) continue; // every bucket scoped by iteration membership
 
+      // All four buckets scope by current-stage iteration membership — matching
+      // the board. Done is "status === Done in this iteration", NOT GitHub's
+      // closedAt, which reflects when the issue was closed (often an earlier
+      // stage) rather than when the card was moved to Done.
       const status = (it.status || '').toLowerCase();
       let key;
       if (status === 'done') key = 'done';
@@ -1748,23 +1752,57 @@ bot.onText(/^\/scoreboard(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
       acc.todo += r.todo; acc.inProgress += r.inProgress; acc.other += r.other; acc.done += r.done; return acc;
     }, { todo: 0, inProgress: 0, other: 0, done: 0 });
 
+    // Deduplicated unique counts: each ticket counted ONCE regardless of how many
+    // assignees it has. This is the number that should match the board / GitHub.
+    // All buckets scope by iteration membership (isInCurrentStage), including Done.
+    // Per-assignee rows credit a shared ticket to every owner, so their column
+    // sums (totals.*) run higher than these.
+    const uniq = { todo: 0, inProgress: 0, other: 0, done: 0 };
+    for (const it of items) {
+      if (isExcluded(it)) continue;
+      if (!isInCurrentStage(it, stage)) continue;
+      const s = (it.status || '').toLowerCase();
+      if (s === 'done') uniq.done++;
+      else if (s === 'todo' || s === 'to do') uniq.todo++;
+      else if (s === 'in progress') uniq.inProgress++;
+      else uniq.other++;
+    }
+
+    // Data-hygiene flag: tickets marked Done but NOT staged to the current stage's
+    // iteration — i.e. Done work missing from this stage's board. These are the
+    // genuine gaps to fix; Done is no longer keyed off the stale closedAt.
+    const doneNotStaged = items.filter(it =>
+      !isExcluded(it) &&
+      (it.status || '').toLowerCase() === 'done' &&
+      !isInCurrentStage(it, stage));
+    const doneGap = totals.done - uniq.done;
+
     // Server-side verification log (visible via `journalctl -u clawdbot -f`).
     const inStageCount = items.filter(it => isInCurrentStage(it, stage)).length;
     console.log(`[scoreboard] ${stage.label}: fetched ${items.length} items from board; ${inStageCount} pass isInCurrentStage()`);
+    console.log(`[scoreboard] unique — To Do ${uniq.todo}, In Progress ${uniq.inProgress}, Other ${uniq.other}, Done ${uniq.done}; credited Done ${totals.done} (gap ${doneGap} from shared assignees); Done-not-staged-to-${stage.label}: ${doneNotStaged.length}`);
     for (const r of rows) {
       console.log(`[scoreboard] @${r.assignee}: stage total ${r.total} — To Do ${r.todo}, In Progress ${r.inProgress}, Other ${r.other}, Done ${r.done}`);
     }
 
     const headerLine = `Scoreboard — ${stage.label} (${stage.startLabel} to ${stage.endLabel})`;
-    const totalLine = `Total — To Do: ${totals.todo} | In Progress: ${totals.inProgress} | Other: ${totals.other} | Done: ${totals.done}`;
+    const totalLine = `Total (unique tickets) — To Do: ${uniq.todo} | In Progress: ${uniq.inProgress} | Other: ${uniq.other} | Done: ${uniq.done}`;
+    const creditedLine = `Credited per-assignee totals (shared tickets counted once per owner) — To Do: ${totals.todo} | In Progress: ${totals.inProgress} | Other: ${totals.other} | Done: ${totals.done}`;
+
+    const validationLines = [
+      `All buckets scoped to ${stage.label} (${stage.startLabel}–${stage.endLabel}) by iteration membership. Done: ${uniq.done} unique, credited ${totals.done} across assignees (${doneGap} extra credits from multi-assignee tickets).`,
+      doneNotStaged.length
+        ? `FLAG: ${doneNotStaged.length} ticket(s) are status Done but NOT staged to ${stage.label} (excluded from this report): ${doneNotStaged.slice(0, 30).map(it => `#${it.number ?? '—'}`).join(', ')}${doneNotStaged.length > 30 ? ' …' : ''}`
+        : `No Done tickets are missing from ${stage.label}'s iteration — board is consistent.`,
+    ];
 
     const prompt = [
       `Generate a compact, factual per-assignee scoreboard for the GitHub project "${title}".`,
       ``,
       `STRICT RULES:`,
-      `- Counts only. No ticket titles or numbers, no narrative paragraphs, no opinions or pleasantries.`,
-      `- Do NOT use markdown tables. Reproduce the data lines below verbatim — do not add, drop, reorder, reword, or summarise.`,
-      `- Output the header line first, then every assignee line in the given order, then the total line last, and nothing else.`,
+      `- Counts only. No ticket titles, no narrative paragraphs, no opinions or pleasantries.`,
+      `- Do NOT use markdown tables. Reproduce every data line below verbatim — do not add, drop, reorder, reword, or summarise.`,
+      `- Output the sections in the order given, with the exact section headers shown, and nothing else.`,
       ``,
       `=== HEADER (output exactly, as the first line) ===`,
       headerLine,
@@ -1772,8 +1810,12 @@ bot.onText(/^\/scoreboard(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
       `=== ASSIGNEE LINES (output verbatim, in order; if "None", output just: None) ===`,
       rowLines.length ? rowLines.join('\n') : 'None',
       ``,
-      `=== TOTAL LINE (output exactly, as the last line) ===`,
+      `=== TOTALS (output both lines verbatim) ===`,
       totalLine,
+      creditedLine,
+      ``,
+      `=== VALIDATION (print the header "Validation" then output these lines verbatim) ===`,
+      validationLines.join('\n'),
     ].join('\n');
 
     const response = await anthropic.messages.create({
