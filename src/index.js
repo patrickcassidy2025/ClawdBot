@@ -716,18 +716,9 @@ function wasCompletedThisStage(item, stage) {
 }
 
 // Diagnostic: explain which stage-membership rule an item matched (or why it
-// didn't). Mirrors the logic of isInCurrentStage()/wasCompletedThisStage().
-// Used only by /scoreboard debug to keep verification transparent.
+// didn't). Mirrors isInCurrentStage() exactly — the rule /scoreboard uses for
+// every status. Used only by /scoreboard debug to keep verification transparent.
 function classifyStageMatch(item, stage) {
-  const status = (item.status || '').toLowerCase();
-  // Pass 2: Done items are counted via their closedAt falling in the window.
-  if (status === 'done' && item.closedAt) {
-    const t = new Date(item.closedAt).getTime();
-    if (Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc) {
-      return 'pass2-done: closedAt within stage window';
-    }
-    return 'no-match: Done but closedAt outside stage window';
-  }
   // Pass 1: explicit iteration assignment wins when present.
   if (item.iterationTitle) {
     const m = item.iterationTitle.match(/(\d+)/);
@@ -1732,12 +1723,14 @@ bot.onText(/^\/scoreboard(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
       if (isExcluded(it)) continue;
       if (!it.assignees || !it.assignees.length) continue; // skip unassigned
 
+      // Scope every bucket by current-stage membership (iteration tag, or
+      // createdAt fallback) so Done matches the board's iteration-filtered
+      // Done column — not GitHub's closedAt timestamp.
       const status = (it.status || '').toLowerCase();
       let key = null;
-      if (status === 'done') {
-        if (wasCompletedThisStage(it, stage)) key = 'done';
-      } else if (isInCurrentStage(it, stage)) {
-        if (status === 'todo') key = 'todo';
+      if (isInCurrentStage(it, stage)) {
+        if (status === 'done') key = 'done';
+        else if (status === 'todo') key = 'todo';
         else if (IN_PROGRESS_STATUSES.has(status)) key = 'inProgress';
       }
       if (!key) continue;
