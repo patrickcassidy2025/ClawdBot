@@ -1,90 +1,88 @@
 # /closed — Closed tickets report
 
 **Date:** 2026-08-13
-**Status:** Approved
+**Status:** Implemented
 
 ## Purpose
 
-`/scoreboard` buckets board statuses into To Do, In Progress, Done, and Other. Tickets whose Status field is literally `Closed` fall into Other, where they are indistinguishable from Backlog, In Review, On hold, and the rest. There is currently no way to see them.
-
-`/closed` lists every ticket in the current stage whose board Status is `Closed`.
-
-## Scope
-
-**In scope:** one new Telegram command handler, one new line in `/help`.
-
-**Out of scope:** changes to `/scoreboard`'s bucketing, new helpers, refactoring of existing handlers, any stage other than the current one.
+`/closed` lists every ticket that was **closed during the current stage**.
 
 ## Definition of "closed"
 
-A ticket is included when **both** hold:
+A ticket is included when its `closedAt` timestamp falls inside the current stage window:
 
-1. `(it.status || '').toLowerCase() === 'closed'` — the board Status single-select field, exactly `Closed`.
-2. `isInCurrentStage(it, stage)` — iteration membership, per the existing helper at `src/index.js:694`.
+```js
+it.closedAt && t >= stage.startUtc && t < stage.endUtc
+```
 
-Deliberately **not** used:
+Start inclusive, end exclusive — `stageEndUtc` (`src/index.js:652`) is the start of the day after the stage's final day, so the final day is fully covered. Same window convention as `wasCompletedThisStage` (`src/index.js:710`).
 
-- `closedAt` — reflects when GitHub closed the underlying issue, frequently in an earlier stage than the one the card is staged to. Commits `91db5f4` and `fa89ae9` moved `/scoreboard` off this field for exactly that reason; `/closed` must not reintroduce it.
-- `COMPLETED_STATUSES` (`src/index.js:620`) — that set spans Done, Won't do, Cancelled, and Closed. This report is only the literal `Closed` status.
-- GitHub issue `state === 'CLOSED'` — the board Status field is the source of truth for the report.
+### Corrected from the original draft
 
-Scoping by `isInCurrentStage` rather than a date window makes `/closed` consistent with every `/scoreboard` bucket.
+The first version of this spec defined inclusion as board Status `== "Closed"` scoped by `isInCurrentStage`. **Both halves were wrong**, and the command shipped returning `Total: 0` against a board that visibly had closed tickets.
+
+- **There is no `Closed` status on the board.** The original design inferred one from `COMPLETED_STATUSES` (`src/index.js:620`), but that set is merely a list of strings the code tests against — not evidence of the board's actual status vocabulary. The status field is not part of the filter at all now.
+- **Iteration membership is the wrong scope for this report.** `isInCurrentStage` (`src/index.js:695`) resolves an explicit iteration when set, and otherwise falls back to whether `createdAt` lands in the stage window. A ticket closed during Stage 15 was typically created — and staged — during an earlier stage, so both branches reject it. Scoping by close date is the point of the report.
+
+Consequences of the corrected definition, all intentional:
+
+- The report is **status-blind**. Anything closed in the window appears, whatever its board status — Done, Won't do, Cancelled, or no status. The `By status` line exists so that mix is visible rather than hidden.
+- The report is **iteration-blind**. A ticket staged to Stage 12 but closed during Stage 15 is reported under Stage 15.
+- **Draft issues never appear.** `DraftIssue` has no `closedAt` in `PROJECT_ITEMS_QUERY` (`src/index.js:494`). Only Issues and PullRequests can qualify.
+- **Merged PRs count as closed**, since GitHub sets `closedAt` on merge.
 
 ## Command surface
 
 ```
 /closed
 /closed in md
+/closed debug
 ```
 
-Regex mirrors `/new`:
+Regex: `/^\/closed(?:@\w+)?(?:\s+([\s\S]+))?$/i`
 
-```js
-/^\/closed(?:@\w+)?(\s+in\s+md)?$/i
-```
+`debug` prints the resolved window as ISO timestamps, how many board items have a `closedAt` at all versus inside the window, the status vocabulary of the matched set, and per-ticket `closedAt` / status / iteration / `isInCurrentStage`. It exists because the filter is a date-window comparison whose result is not obvious from the board UI.
 
 ## Output format
 
 ```
-Closed tickets — Stage NN (12 Aug – 25 Aug)
-Total: 7
-By assignee: @alice 3 · @bob 2 · @carol 2
+Closed tickets — Stage 15 (10 Aug 2026 – 23 Aug 2026)
+Total: 3
+By status: Done 2 · Won't do 1
+By assignee: @alice 2 · @bob 1 · Unassigned 1
 
-  - #412 Fix auth redirect loop — @alice
-  - #418 Remove legacy webhook — @bob
-  - #421 Drop unused index — @carol
+  - [2026-08-11] #418 Remove legacy webhook — @bob, @alice
+  - [2026-08-12] web#412 (https://github.com/acme/web/issues/412) Fix auth redirect loop — @alice
+  - [2026-08-20] #421 Drop unused index
 ```
 
-- Header uses `stage.label` and `stage.rangeLabel`.
-- `By assignee` tallies each assignee, sorted by count descending, joined with ` · `. A multi-assignee ticket is credited to each owner, so the tally can exceed `Total` — same convention as `/scoreboard`'s credited row.
-- Ticket lines use `ticketRef(item)` (`src/index.js:795`) for the reference, matching `/new`'s `formatItem`.
-- Tickets with no assignee are listed with no ` — @…` suffix and counted under an `Unassigned` entry in the tally. They are **not** dropped: `/scoreboard` skips unassigned tickets because it is a per-person board, but a "show me everything closed" report that silently hides tickets would be wrong.
-
-## Generation
-
-Built directly in code, like `/new` — no Anthropic API call. The reply is a plain list of facts; routing it through the model adds latency, cost, and a hallucination surface for no gain. `/scoreboard` already has to constrain the model with STRICT RULES to stop it reformatting verbatim data.
+- Tickets sorted by `closedAt` ascending; each line prefixed with its close date, since close date is the report's organising fact.
+- `By status` shows the board status mix of the matched set.
+- `By assignee` credits a multi-assignee ticket to each owner, so the tally can exceed `Total` — same convention as `/scoreboard`'s credited row. `Total` is the unique count.
+- Ticket references via `ticketRef` (`src/index.js:795`), matching `/new`.
+- Unassigned tickets are listed and counted under `Unassigned`, not dropped.
 
 ## Edge cases
 
 | Case | Behaviour |
 |---|---|
-| No matching tickets | Header + `Total: 0`, single message, no tally line and no blank-line gap |
-| `GITHUB_PROJECT_ORG` / `GITHUB_PROJECT_NUMBER` unset | Same guard message the other board handlers emit |
-| Rate limited | `rateLimited(chatId)` checked first, before any work |
-| Long list | `chunkMessage` splits across Telegram messages, as elsewhere |
-| Fetch failure | Caught, logged to `console.error`, replies `Couldn't fetch closed tickets: <message>` |
+| No matching tickets | Header + `Total: 0`, single message, no tally lines |
+| `GITHUB_PROJECT_ORG` / `GITHUB_PROJECT_NUMBER` unset | Same guard message as the other board handlers |
+| Rate limited | `rateLimited(chatId)` checked first |
+| Long list | `chunkMessage` splits across messages |
+| Fetch failure | Logged, replies `Couldn't fetch closed tickets: <message>` |
 
 ## Side effects
 
-- `insertMessage` records both a `[Closed tickets requested: Stage NN]` user marker and the reply, keeping the report in conversation history like its siblings.
-- One `console.log('[closed] …')` verification line reporting board size, in-stage count, and match count — visible via `journalctl -u clawdbot -f`, matching the `[scoreboard]` logging convention.
-
-## Files changed
-
-| File | Change |
-|---|---|
-| `src/index.js` | New handler after the `/new` handler (~line 1330); one line added to the `/help` list (~line 137) |
+- `insertMessage` records a `[Closed tickets requested: Stage NN]` marker and the reply.
+- One `console.log('[closed] …')` line with board size and match count, visible via `journalctl -u clawdbot -f`.
 
 ## Verification
 
-`/closed`'s total must equal the count of `Closed` tickets visible on the board filtered to the current iteration. Cross-check against `/scoreboard raw`, whose status breakdown prints a `Closed` row scoped the same way — the two numbers must agree.
+Fixture checks cover the window boundaries (start instant included, final day 23:59 included, the instant after the window excluded), the regression that caused `Total: 0` (a ticket staged to an earlier iteration but closed in this window must appear), exclusion of never-closed tickets, close-date ordering, and the assignee/status tallies.
+
+Not yet verified end to end: the reported total against the board's own count of tickets closed in the stage window. The repo has no test framework and `src/index.js` starts the bot on import, so the fixture checks exercise the logic transcribed into a scratch script, not the deployed handler.
+
+## Deployment note
+
+`git pull` alone does not take effect — Node holds the old module in memory. `systemctl restart clawdbot` is required. An unregistered slash command is answered with **complete silence**, because the generic message handler returns early on `/`-prefixed text (`src/index.js:2130`); silence therefore means "not deployed", never "no results".

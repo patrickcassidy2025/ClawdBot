@@ -135,7 +135,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/standup — yesterday/today/blockers standup update',
     '/retrospective — sprint retrospective for the current stage',
     '/new — new tickets created during the current stage, grouped by Type and Area',
-    '/closed — tickets with status Closed in the current stage',
+    '/closed — tickets closed during the current stage',
     '/ask <question> — natural-language Q&A over recent GitHub activity',
     '',
     'You can also send me:',
@@ -1349,65 +1349,53 @@ bot.onText(/^\/closed(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
     const { items } = await fetchProjectItems(org, number);
     const stage = getCurrentStage();
 
-    // ---- DEBUG MODE: why did a ticket match or miss? ----
-    // Reports the board's exact status vocabulary (JSON-quoted, so trailing
-    // whitespace and emoji are visible) and, for every ticket whose status
-    // merely CONTAINS "closed", the stage-membership verdict. Distinguishes a
-    // status-string mismatch from an isInCurrentStage() exclusion.
-    if (isDebug) {
-      const ts = (iso) => iso ? new Date(iso).toISOString().slice(0, 19).replace('T', ' ') : '—';
-
-      const statusTally = new Map();
-      for (const it of items) {
-        const raw = it.status ?? null;
-        statusTally.set(raw, (statusTally.get(raw) || 0) + 1);
-      }
-
-      const candidates = items.filter(it => /closed/i.test(it.status || ''));
-      const exactMatch = items.filter(it => (it.status || '').toLowerCase() === 'closed');
-      const staged = candidates.filter(it => isInCurrentStage(it, stage));
-
-      const DISPLAY_CAP = 100;
-      const lines = [
-        `Closed DEBUG — ${stage.label} (${stage.startLabel} to ${stage.endLabel})`,
-        `Total items on board: ${items.length}`,
-        `Status contains "closed" (any spelling): ${candidates.length}`,
-        `Status === "closed" exactly (after lowercase, the live filter): ${exactMatch.length}`,
-        `…of those candidates, isInCurrentStage() true: ${staged.length}`,
-        `Reported by /closed = exact AND in-stage: ${exactMatch.filter(it => isInCurrentStage(it, stage)).length}`,
-        ``,
-        `Board status vocabulary (exact strings, quoted):`,
-        ...[...statusTally.entries()]
-          .sort((a, b) => b[1] - a[1])
-          .map(([s, c]) => `  ${s === null ? '(null)' : JSON.stringify(s)}: ${c}`),
-        ``,
-        `Closed-ish tickets (capped at ${DISPLAY_CAP}):`,
-      ];
-      for (const it of candidates.slice(0, DISPLAY_CAP)) {
-        const verdict = classifyStageMatch(it, stage);
-        const line =
-          `#${it.number ?? '—'} status=${JSON.stringify(it.status || '')} ` +
-          `iteration=${it.iterationTitle || '—'} created=${ts(it.createdAt)} ` +
-          `closedAt=${ts(it.closedAt)} inStage=${isInCurrentStage(it, stage)} → ${verdict}`;
-        console.log(`[closed debug] ${line}`);
-        lines.push(`  ${line}`);
-      }
-      if (candidates.length > DISPLAY_CAP) lines.push(`… ${candidates.length - DISPLAY_CAP} more not shown.`);
-      if (!candidates.length) lines.push(`  None — no ticket on the board has a status containing "closed".`);
-
-      for (const chunk of chunkMessage(lines.join('\n'))) await bot.sendMessage(chatId, chunk, sendOpts(md));
-      return;
-    }
-
-    // Status is literally "Closed" — not the wider COMPLETED_STATUSES set, and
-    // not closedAt, which records when GitHub closed the issue (often an
-    // earlier stage) rather than when the card was moved on the board.
-    const closedItems = items.filter(it =>
-      (it.status || '').toLowerCase() === 'closed' && isInCurrentStage(it, stage));
+    // "Closed during the stage" = the underlying GitHub issue/PR was closed
+    // inside the stage window. The board has no "Closed" status, so status is
+    // NOT part of the filter, and neither is iteration membership: a ticket
+    // closed this stage was usually created — and staged — in an earlier one,
+    // so isInCurrentStage() would wrongly exclude it. Same window convention as
+    // wasCompletedThisStage() (:710): start inclusive, end exclusive.
+    const closedItems = items.filter(it => {
+      if (!it.closedAt) return false;
+      const t = new Date(it.closedAt).getTime();
+      return Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc;
+    }).sort((a, b) => new Date(a.closedAt) - new Date(b.closedAt));
 
     const headerLine = `Closed tickets — ${stage.label} (${stage.rangeLabel})`;
 
-    console.log(`[closed] ${stage.label}: ${items.length} items on board; ${closedItems.length} with status Closed in this stage`);
+    console.log(`[closed] ${stage.label}: ${items.length} items on board; ${closedItems.length} closed within ${stage.rangeLabel}`);
+
+    // ---- DEBUG MODE: show the window and every ticket's closedAt verdict ----
+    if (isDebug) {
+      const ts = (iso) => iso ? new Date(iso).toISOString().slice(0, 19).replace('T', ' ') : '—';
+      const withClosedAt = items.filter(it => it.closedAt);
+      const statusTally = new Map();
+      for (const it of closedItems) {
+        const raw = it.status ?? null;
+        statusTally.set(raw, (statusTally.get(raw) || 0) + 1);
+      }
+      const DISPLAY_CAP = 100;
+      const lines = [
+        `Closed DEBUG — ${stage.label}`,
+        `Window: ${new Date(stage.startUtc).toISOString()} (inclusive) to ${new Date(stage.endUtc).toISOString()} (exclusive)`,
+        `Total items on board: ${items.length}`,
+        `Items with a closedAt at all: ${withClosedAt.length}`,
+        `Items with closedAt inside the window (what /closed reports): ${closedItems.length}`,
+        ``,
+        `Status vocabulary of the reported tickets (exact strings, quoted):`,
+        ...[...statusTally.entries()].sort((a, b) => b[1] - a[1])
+          .map(([s, c]) => `  ${s === null ? '(null)' : JSON.stringify(s)}: ${c}`),
+        ``,
+        `Reported tickets (capped at ${DISPLAY_CAP}):`,
+      ];
+      for (const it of closedItems.slice(0, DISPLAY_CAP)) {
+        lines.push(`  #${it.number ?? '—'} closedAt=${ts(it.closedAt)} status=${JSON.stringify(it.status || '')} iteration=${it.iterationTitle || '—'} inStage=${isInCurrentStage(it, stage)}`);
+      }
+      if (closedItems.length > DISPLAY_CAP) lines.push(`… ${closedItems.length - DISPLAY_CAP} more not shown.`);
+      if (!closedItems.length) lines.push(`  None.`);
+      for (const chunk of chunkMessage(lines.join('\n'))) await bot.sendMessage(chatId, chunk, sendOpts(md));
+      return;
+    }
 
     if (!closedItems.length) {
       const empty = `${headerLine}\nTotal: 0`;
@@ -1429,16 +1417,31 @@ bot.onText(/^\/closed(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
       .map(([a, c]) => `${a === 'Unassigned' ? a : `@${a}`} ${c}`)
       .join(' · ');
 
+    // Board status of the closed tickets. Worth showing because the filter is
+    // closedAt-based and status-blind, so the set mixes Done with Won't do,
+    // Cancelled and anything else that got closed inside the window.
+    const statusCounts = new Map();
+    for (const it of closedItems) {
+      const s = it.status || 'No status';
+      statusCounts.set(s, (statusCounts.get(s) || 0) + 1);
+    }
+    const statusLine = [...statusCounts.entries()]
+      .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+      .map(([s, c]) => `${s} ${c}`)
+      .join(' · ');
+
+    const fmtDay = (iso) => new Date(iso).toISOString().slice(0, 10);
     const formatItem = (item) => {
       const r = ticketRef(item);
       const ref = r ? `${r} ` : '';
       const who = item.assignees.length ? ` — @${item.assignees.join(', @')}` : '';
-      return `  - ${ref}${item.title}${who}`;
+      return `  - [${fmtDay(item.closedAt)}] ${ref}${item.title}${who}`;
     };
 
     const lines = [
       headerLine,
       `Total: ${closedItems.length}`,
+      `By status: ${statusLine}`,
       `By assignee: ${tally}`,
       ``,
       ...closedItems.map(formatItem),
