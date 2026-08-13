@@ -135,6 +135,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/standup — yesterday/today/blockers standup update',
     '/retrospective — sprint retrospective for the current stage',
     '/new — new tickets created during the current stage, grouped by Type and Area',
+    '/closed — tickets with status Closed in the current stage',
     '/ask <question> — natural-language Q&A over recent GitHub activity',
     '',
     'You can also send me:',
@@ -1325,6 +1326,81 @@ bot.onText(/^\/new(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
   } catch (err) {
     console.error('New tickets handler error:', err);
     await bot.sendMessage(chatId, `Couldn't fetch new tickets: ${err.message}`);
+  }
+});
+
+bot.onText(/^\/closed(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+  const md = !!(match && match[1]);
+
+  const org = process.env.GITHUB_PROJECT_ORG;
+  const number = Number(process.env.GITHUB_PROJECT_NUMBER);
+  if (!org || !Number.isInteger(number)) {
+    await bot.sendMessage(chatId, 'Project board not configured: set GITHUB_PROJECT_ORG and GITHUB_PROJECT_NUMBER.');
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+    const { items } = await fetchProjectItems(org, number);
+    const stage = getCurrentStage();
+
+    // Status is literally "Closed" — not the wider COMPLETED_STATUSES set, and
+    // not closedAt, which records when GitHub closed the issue (often an
+    // earlier stage) rather than when the card was moved on the board.
+    const closedItems = items.filter(it =>
+      (it.status || '').toLowerCase() === 'closed' && isInCurrentStage(it, stage));
+
+    const headerLine = `Closed tickets — ${stage.label} (${stage.rangeLabel})`;
+
+    console.log(`[closed] ${stage.label}: ${items.length} items on board; ${closedItems.length} with status Closed in this stage`);
+
+    if (!closedItems.length) {
+      const empty = `${headerLine}\nTotal: 0`;
+      insertMessage.run(chatId, 'user', `[Closed tickets requested: ${stage.label}]`, Date.now());
+      insertMessage.run(chatId, 'assistant', empty, Date.now());
+      await bot.sendMessage(chatId, empty, sendOpts(md));
+      return;
+    }
+
+    // Multi-assignee tickets are credited to every owner, so this tally can
+    // exceed Total — same convention as /scoreboard's credited row.
+    const assigneeCounts = new Map();
+    for (const it of closedItems) {
+      const owners = it.assignees.length ? it.assignees : ['Unassigned'];
+      for (const a of owners) assigneeCounts.set(a, (assigneeCounts.get(a) || 0) + 1);
+    }
+    const tally = [...assigneeCounts.entries()]
+      .sort((a, b) => (b[1] - a[1]) || a[0].localeCompare(b[0]))
+      .map(([a, c]) => `${a === 'Unassigned' ? a : `@${a}`} ${c}`)
+      .join(' · ');
+
+    const formatItem = (item) => {
+      const r = ticketRef(item);
+      const ref = r ? `${r} ` : '';
+      const who = item.assignees.length ? ` — @${item.assignees.join(', @')}` : '';
+      return `  - ${ref}${item.title}${who}`;
+    };
+
+    const lines = [
+      headerLine,
+      `Total: ${closedItems.length}`,
+      `By assignee: ${tally}`,
+      ``,
+      ...closedItems.map(formatItem),
+    ];
+
+    const reply = lines.join('\n').trimEnd();
+    insertMessage.run(chatId, 'user', `[Closed tickets requested: ${stage.label}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk, sendOpts(md));
+    }
+  } catch (err) {
+    console.error('Closed tickets handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't fetch closed tickets: ${err.message}`);
   }
 });
 
