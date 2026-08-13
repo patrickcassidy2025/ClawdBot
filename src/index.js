@@ -1329,10 +1329,13 @@ bot.onText(/^\/new(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
   }
 });
 
-bot.onText(/^\/closed(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
+bot.onText(/^\/closed(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
   const chatId = msg.chat.id;
   if (await rateLimited(chatId)) return;
-  const md = !!(match && match[1]);
+  const arg = (match && match[1] ? match[1].trim() : '');
+  const lower = arg.toLowerCase();
+  const md = lower === 'in md';
+  const isDebug = lower === 'debug';
 
   const org = process.env.GITHUB_PROJECT_ORG;
   const number = Number(process.env.GITHUB_PROJECT_NUMBER);
@@ -1345,6 +1348,56 @@ bot.onText(/^\/closed(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
     await bot.sendChatAction(chatId, 'typing');
     const { items } = await fetchProjectItems(org, number);
     const stage = getCurrentStage();
+
+    // ---- DEBUG MODE: why did a ticket match or miss? ----
+    // Reports the board's exact status vocabulary (JSON-quoted, so trailing
+    // whitespace and emoji are visible) and, for every ticket whose status
+    // merely CONTAINS "closed", the stage-membership verdict. Distinguishes a
+    // status-string mismatch from an isInCurrentStage() exclusion.
+    if (isDebug) {
+      const ts = (iso) => iso ? new Date(iso).toISOString().slice(0, 19).replace('T', ' ') : '—';
+
+      const statusTally = new Map();
+      for (const it of items) {
+        const raw = it.status ?? null;
+        statusTally.set(raw, (statusTally.get(raw) || 0) + 1);
+      }
+
+      const candidates = items.filter(it => /closed/i.test(it.status || ''));
+      const exactMatch = items.filter(it => (it.status || '').toLowerCase() === 'closed');
+      const staged = candidates.filter(it => isInCurrentStage(it, stage));
+
+      const DISPLAY_CAP = 100;
+      const lines = [
+        `Closed DEBUG — ${stage.label} (${stage.startLabel} to ${stage.endLabel})`,
+        `Total items on board: ${items.length}`,
+        `Status contains "closed" (any spelling): ${candidates.length}`,
+        `Status === "closed" exactly (after lowercase, the live filter): ${exactMatch.length}`,
+        `…of those candidates, isInCurrentStage() true: ${staged.length}`,
+        `Reported by /closed = exact AND in-stage: ${exactMatch.filter(it => isInCurrentStage(it, stage)).length}`,
+        ``,
+        `Board status vocabulary (exact strings, quoted):`,
+        ...[...statusTally.entries()]
+          .sort((a, b) => b[1] - a[1])
+          .map(([s, c]) => `  ${s === null ? '(null)' : JSON.stringify(s)}: ${c}`),
+        ``,
+        `Closed-ish tickets (capped at ${DISPLAY_CAP}):`,
+      ];
+      for (const it of candidates.slice(0, DISPLAY_CAP)) {
+        const verdict = classifyStageMatch(it, stage);
+        const line =
+          `#${it.number ?? '—'} status=${JSON.stringify(it.status || '')} ` +
+          `iteration=${it.iterationTitle || '—'} created=${ts(it.createdAt)} ` +
+          `closedAt=${ts(it.closedAt)} inStage=${isInCurrentStage(it, stage)} → ${verdict}`;
+        console.log(`[closed debug] ${line}`);
+        lines.push(`  ${line}`);
+      }
+      if (candidates.length > DISPLAY_CAP) lines.push(`… ${candidates.length - DISPLAY_CAP} more not shown.`);
+      if (!candidates.length) lines.push(`  None — no ticket on the board has a status containing "closed".`);
+
+      for (const chunk of chunkMessage(lines.join('\n'))) await bot.sendMessage(chatId, chunk, sendOpts(md));
+      return;
+    }
 
     // Status is literally "Closed" — not the wider COMPLETED_STATUSES set, and
     // not closedAt, which records when GitHub closed the issue (often an
