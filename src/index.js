@@ -136,6 +136,7 @@ bot.onText(/^\/help(?:@\w+)?$/, async (msg) => {
     '/retrospective — sprint retrospective for the current stage',
     '/new — new tickets created during the current stage, grouped by Type and Area',
     '/closed — tickets closed during the current stage',
+    '/weekly — TPM-style delivery status report for the current stage',
     '/ask <question> — natural-language Q&A over recent GitHub activity',
     '',
     'You can also send me:',
@@ -1462,6 +1463,295 @@ bot.onText(/^\/closed(?:@\w+)?(?:\s+([\s\S]+))?$/i, async (msg, match) => {
   } catch (err) {
     console.error('Closed tickets handler error:', err);
     await bot.sendMessage(chatId, `Couldn't fetch closed tickets: ${err.message}`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// /weekly — TPM-style delivery status report for the current stage.
+// Combines project board items (fetchProjectItems) with raw GitHub issue flow
+// across every configured repo, then asks Claude to render a fixed structure.
+// ---------------------------------------------------------------------------
+
+// Tickets whose subject matter bears on CI/stability confidence. Matched
+// against title only — body text isn't fetched for board items.
+const STABILITY_KEYWORD_RE =
+  /\b(test|tests|testing|flake|flaky|flakiness|ci|pipeline|build|coverage|cve|vulnerab\w*|security|dependabot|snyk|patch|upgrade|infra|infrastructure|deploy\w*|docker|k8s|kubernetes|terraform|outage|regression)\b/i;
+
+function isStabilityRelated(title) {
+  return STABILITY_KEYWORD_RE.test(title || '');
+}
+
+// Issue flow per repo for a stage window. The REST issues endpoint returns
+// pull requests too, so they're filtered out — counting them would inflate
+// ticket flow. `since` filters on updated_at, which is a superset of anything
+// created or closed inside the window.
+async function fetchStageIssueFlow(stage) {
+  const repos = getConfiguredRepos();
+  if (!repos.length) return [];
+  const sinceIso = new Date(stage.startUtc).toISOString();
+
+  const inStage = (iso) => {
+    if (!iso) return false;
+    const t = new Date(iso).getTime();
+    return Number.isFinite(t) && t >= stage.startUtc && t < stage.endUtc;
+  };
+
+  return Promise.all(repos.map(async (repo) => {
+    try {
+      const [touchedRes, openRes] = await Promise.all([
+        githubFetch(`/repos/${repo}/issues?state=all&since=${encodeURIComponent(sinceIso)}&per_page=100`),
+        githubFetch(`/repos/${repo}/issues?state=open&per_page=100`),
+      ]);
+      const touchedRaw = await touchedRes.json();
+      const openRaw = await openRes.json();
+      const touched = touchedRaw.filter(i => !i.pull_request);
+      const open = openRaw.filter(i => !i.pull_request);
+
+      const created = touched.filter(i => inStage(i.created_at));
+      const closed = touched.filter(i => inStage(i.closed_at));
+      const sameStage = created.filter(i => inStage(i.closed_at));
+
+      return {
+        repo,
+        created,
+        closed,
+        sameStage,
+        open,
+        // Neither call paginates; at 100 rows the window is capped and the
+        // counts below are a floor, not a total.
+        truncated: touchedRaw.length >= 100 || openRaw.length >= 100,
+        error: null,
+      };
+    } catch (err) {
+      console.error(`Issue flow fetch failed for ${repo}:`, err);
+      return { repo, created: [], closed: [], sameStage: [], open: [], truncated: false, error: err.message };
+    }
+  }));
+}
+
+// Latest deployment from the delivery-intelligence dashboard. Best-effort:
+// the dashboard being down must not fail the whole report.
+async function fetchCurrentDeployment() {
+  try {
+    const res = await fetch(`${DASHBOARD_URL}/api/deployments`);
+    if (!res.ok) {
+      console.error(`Deployments fetch failed: ${res.status} ${res.statusText}`);
+      return null;
+    }
+    const body = await res.json();
+    const list = Array.isArray(body) ? body : (body?.deployments ?? []);
+    return list[0] ?? null;
+  } catch (err) {
+    console.error('Deployments fetch failed:', err);
+    return null;
+  }
+}
+
+bot.onText(/^\/weekly(?:@\w+)?(\s+in\s+md)?$/i, async (msg, match) => {
+  const chatId = msg.chat.id;
+  if (await rateLimited(chatId)) return;
+  const md = !!(match && match[1]);
+
+  const org = process.env.GITHUB_PROJECT_ORG;
+  const number = Number(process.env.GITHUB_PROJECT_NUMBER);
+  if (!org || !Number.isInteger(number)) {
+    await bot.sendMessage(chatId, 'Project board not configured: set GITHUB_PROJECT_ORG and GITHUB_PROJECT_NUMBER.');
+    return;
+  }
+
+  try {
+    await bot.sendChatAction(chatId, 'typing');
+    const stage = getCurrentStage();
+
+    const [project, issueFlow, deployment] = await Promise.all([
+      fetchProjectItems(org, number),
+      fetchStageIssueFlow(stage),
+      fetchCurrentDeployment(),
+    ]);
+    const { items, title, url } = project;
+
+    // --- Project board data sets -------------------------------------------
+    const live = items.filter(it => (it.status || '').toLowerCase() !== "won't do");
+    const stageItems = live.filter(it => isInCurrentStage(it, stage));
+    const completed = live.filter(it => wasCompletedThisStage(it, stage));
+
+    const openBlockers = stageItems.filter(isBlocker);
+    const resolvedBlockers = completed.filter(
+      it => (it.priority || '').toLowerCase() === 'blocker'
+    );
+
+    // Stale: claimed as In Progress but untouched since before the stage began.
+    const staleInProgress = stageItems.filter(it => {
+      if (it.status !== 'In Progress') return false;
+      const t = it.updatedAt ? new Date(it.updatedAt).getTime() : NaN;
+      return Number.isFinite(t) && t < stage.startUtc;
+    });
+
+    const stabilityItems = stageItems.filter(it => isStabilityRelated(it.title));
+    const stabilityClosed = completed.filter(it => isStabilityRelated(it.title));
+
+    // --- Issue flow metrics -------------------------------------------------
+    const totals = issueFlow.reduce((acc, r) => {
+      acc.created += r.created.length;
+      acc.closed += r.closed.length;
+      acc.sameStage += r.sameStage.length;
+      acc.open += r.open.length;
+      return acc;
+    }, { created: 0, closed: 0, sameStage: 0, open: 0 });
+    const netFlow = totals.created - totals.closed;
+
+    // --- Prompt data sections ----------------------------------------------
+    const formatItem = (it) => {
+      const r = ticketRef(it);
+      const ref = r ? `${r} ` : '';
+      const who = it.assignees.length ? ` — @${it.assignees.join(', @')}` : '';
+      const pri = it.priority ? ` [priority: ${it.priority}]` : '';
+      const st = it.status ? ` [status: ${it.status}]` : '';
+      return `  - ${ref}${it.title}${who}${pri}${st}`;
+    };
+    const section = (list) => (list.length ? list.map(formatItem).join('\n') : '(none)');
+
+    const formatIssue = (repo) => (i) => {
+      const who = i.assignees?.length ? ` — @${i.assignees.map(a => a.login).join(', @')}` : '';
+      const repoName = repo.split('/').pop();
+      return `  - ${repoName}#${i.number} (${i.html_url}) ${i.title}${who}`;
+    };
+
+    const flowLines = issueFlow.map(r => {
+      if (r.error) return `  - ${r.repo}: fetch failed (${r.error})`;
+      const cap = r.truncated ? ' [CAPPED at 100 — treat these as a floor, not a total]' : '';
+      return `  - ${r.repo}: created ${r.created.length}, closed ${r.closed.length}, ` +
+        `net ${r.created.length - r.closed.length}, same-stage turnaround ${r.sameStage.length}, ` +
+        `currently open ${r.open.length}${cap}`;
+    });
+
+    const issueDetail = (key, heading) => {
+      const blocks = issueFlow
+        .filter(r => r[key].length)
+        .map(r => `${r.repo} (${r[key].length}):\n` +
+          r[key].slice(0, 40).map(formatIssue(r.repo)).join('\n') +
+          (r[key].length > 40 ? `\n  ... ${r[key].length - 40} more not listed` : ''));
+      return `${heading}:\n` + (blocks.length ? blocks.join('\n') : '(none)');
+    };
+
+    const deploymentLine = deployment
+      ? `Current deployed version: ${deployment.deployment_id ?? 'unknown'}` +
+        `${deployment.created_at ? `, deployed ${deployment.created_at}` : ''}` +
+        `${deployment.creator ? `, by ${deployment.creator}` : ''}`
+      : 'Current deployed version: unavailable (dashboard did not respond)';
+
+    const todayLabel = new Date().toLocaleDateString('en-GB', {
+      day: 'numeric', month: 'long', year: 'numeric',
+    });
+
+    const prompt = [
+      `Today's date is ${todayLabel}.`,
+      `You are writing a weekly delivery status report in the style of a technical programme manager (TPM) weekly summary, for the GitHub project "${title}" (${url}).`,
+      `Current stage: ${stage.label} (${stage.rangeLabel}).`,
+      ``,
+      `SCOPE: Every number, ticket and name in your report must come from the DATA section below. Do not reference historical totals, previous stages, or anything absent from the data. Do not invent risks, owners, dates, tickets or causes. If the data does not support a point, omit that point.`,
+      ``,
+      `STRUCTURE — produce exactly these parts, in this order:`,
+      ``,
+      `1. Header line, verbatim: "Synergy delivery status — ${stage.startLabel} to ${stage.endLabel}"`,
+      ``,
+      `2. Overall RAG status: one of 🟢 Green, 🟡 Amber or 🔴 Red, followed by exactly one sentence justifying the rating against specific data points (cite counts or ticket references from the data).`,
+      ``,
+      `3. "Section 1 — What changed this stage" — factual bullets only, covering:`,
+      `   - issues created versus closed, and the net flow figure`,
+      `   - the same-stage turnaround count (created and closed inside this stage)`,
+      `   - current open issue count per repo`,
+      `   - any significant change from the previous pattern, but only if the data below shows it; otherwise omit this bullet`,
+      ``,
+      `4. "Section 2 — Progress and production readiness"`,
+      `   - state the current deployed version from the data`,
+      `   - list material closures (items completed this stage) grouped by theme you infer from their titles`,
+      `   - flag open items that represent production readiness risk: Blocker-priority items still open, and In Progress items with no activity this stage (stale)`,
+      `   - be specific: give ticket number, title and assignee for every item you flag`,
+      ``,
+      `5. "Section 3 — Stability and CI"`,
+      `   - flag tickets relating to test failures, flakiness, security CVEs or infrastructure`,
+      `   - note whether vulnerability tickets were closed or remain open`,
+      `   - comment on CI confidence only if relevant tickets exist; if none exist, say so in one line and move on`,
+      ``,
+      `6. "Section 4 — Decisions and escalations needed"`,
+      `   - 2 to 4 decision points that need leadership attention, drawn strictly from the data`,
+      `   - frame each as "[Audience]: [what decision or action is needed based on data]", for example "Engineering lead: ..." or "Product: ..."`,
+      `   - no invented risks — only what the ticket data supports`,
+      ``,
+      `7. "Section 5 — Priorities for this stage"`,
+      `   - 3 to 5 specific priorities drawn from open blockers, stale In Progress items and open production-readiness risks`,
+      `   - reference ticket numbers where relevant`,
+      ``,
+      `TONE AND STYLE:`,
+      `- Professional TPM tone: factual, direct, no fluff, no pleasantries, no subjective assessment.`,
+      `- Back every claim with a data point from the sets below.`,
+      `- Render assignees as @username.`,
+      `- The RAG rating must be justified by specific data points, not impression.`,
+      TICKET_FORMAT_INSTRUCTION,
+      ...mdFormattingInstructions(md),
+      ``,
+      `=== DATA ===`,
+      ``,
+      `Stage window: ${stage.label}, ${stage.rangeLabel} (both dates inclusive).`,
+      deploymentLine,
+      ``,
+      `ISSUE FLOW TOTALS (GitHub issues, pull requests excluded):`,
+      `  Created this stage: ${totals.created}`,
+      `  Closed this stage: ${totals.closed}`,
+      `  Net flow (created minus closed): ${netFlow >= 0 ? '+' : ''}${netFlow}`,
+      `  Same-stage turnaround (created AND closed in this stage): ${totals.sameStage}`,
+      `  Currently open across all repos: ${totals.open}`,
+      ``,
+      `ISSUE FLOW PER REPO:`,
+      flowLines.length ? flowLines.join('\n') : '  (no repos configured — GITHUB_REPOS / GITHUB_REPO unset)',
+      ``,
+      issueDetail('created', 'ISSUES CREATED THIS STAGE'),
+      ``,
+      issueDetail('closed', 'ISSUES CLOSED THIS STAGE'),
+      ``,
+      issueDetail('sameStage', 'SAME-STAGE TURNAROUND (created and closed within the stage)'),
+      ``,
+      `=== PROJECT BOARD (${stage.label}) ===`,
+      `Items tagged to this stage: ${stageItems.length}`,
+      ``,
+      `COMPLETED THIS STAGE — closed during the stage window (${completed.length}):`,
+      section(completed),
+      ``,
+      `OPEN BLOCKERS — Blocker priority, not Done/Won't do/Cancelled/Closed (${openBlockers.length}):`,
+      section(openBlockers),
+      ``,
+      `BLOCKERS RESOLVED THIS STAGE (${resolvedBlockers.length}):`,
+      section(resolvedBlockers),
+      ``,
+      `STALE — In Progress this stage but not updated since the stage began (${staleInProgress.length}):`,
+      section(staleInProgress),
+      ``,
+      `STABILITY / CI / SECURITY CANDIDATES — open items whose title matches test, flake, CI, build, CVE, security or infrastructure keywords (${stabilityItems.length}):`,
+      section(stabilityItems),
+      ``,
+      `STABILITY / CI / SECURITY CANDIDATES CLOSED THIS STAGE (${stabilityClosed.length}):`,
+      section(stabilityClosed),
+    ].join('\n');
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-5',
+      max_tokens: 2500,
+      system: systemPrompt,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const rawReply = response.content.map(b => b.text ?? '').join('').trim();
+    const reply = linkifyTicketRefs(rawReply, buildUrlMap(items));
+
+    insertMessage.run(chatId, 'user', `[Weekly delivery status requested: ${stage.label}]`, Date.now());
+    insertMessage.run(chatId, 'assistant', reply, Date.now());
+
+    for (const chunk of chunkMessage(reply)) {
+      await bot.sendMessage(chatId, chunk, sendOpts(md));
+    }
+  } catch (err) {
+    console.error('Weekly handler error:', err);
+    await bot.sendMessage(chatId, `Couldn't build the weekly report: ${err.message}`);
   }
 });
 
