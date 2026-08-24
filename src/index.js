@@ -627,9 +627,10 @@ function isBlocker(item) {
   return priority === 'blocker';
 }
 
-// Corrected stage calendar. Stages are explicit (non-uniform length):
-// Stage 09 is 3 weeks; every other stage is 2 weeks, continuing 2-weekly
-// from Stage 10 onwards.
+// Corrected stage calendar. Stages are explicit (non-uniform length), so the
+// list below is the single source of truth — do not derive stages arithmetically.
+// Stage 09 is 3 weeks. Stage 15 was extended by 1 week (10 Aug – 30 Aug), which
+// pushed Stage 16 onwards back by a week; those run 2-weekly from 31 Aug.
 const STAGES = [
   { number: 8,  start: '2026-04-26', end: '2026-05-09' },
   { number: 9,  start: '2026-05-10', end: '2026-05-31' },
@@ -638,8 +639,12 @@ const STAGES = [
   { number: 12, start: '2026-06-29', end: '2026-07-12' },
   { number: 13, start: '2026-07-13', end: '2026-07-26' },
   { number: 14, start: '2026-07-27', end: '2026-08-09' },
-  { number: 15, start: '2026-08-10', end: '2026-08-23' },
-  { number: 16, start: '2026-08-24', end: '2026-09-06' },
+  { number: 15, start: '2026-08-10', end: '2026-08-30' },
+  { number: 16, start: '2026-08-31', end: '2026-09-13' },
+  { number: 17, start: '2026-09-14', end: '2026-09-27' },
+  { number: 18, start: '2026-09-28', end: '2026-10-11' },
+  { number: 19, start: '2026-10-12', end: '2026-10-25' },
+  { number: 20, start: '2026-10-26', end: '2026-11-08' },
 ];
 
 // Start of day (00:00:00.000 UTC) for a 'YYYY-MM-DD' string.
